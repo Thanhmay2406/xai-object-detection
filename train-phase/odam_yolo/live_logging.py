@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 
@@ -202,14 +202,14 @@ class OdamLiveLogger:
         epoch: int,
         batch_index: int,
         batch_size: int,
-        loss_items: torch.Tensor,
+        loss_items: torch.Tensor | Mapping[str, Any],
         lr: float,
         gpu_memory_gb: float,
         stats: Any,
     ) -> None:
         elapsed = 0.0 if self._batch_start_time is None else time.perf_counter() - self._batch_start_time
         throughput = 0.0 if elapsed <= 0 else float(batch_size) / elapsed
-        loss_values = loss_items.detach().float().cpu().tolist()
+        loss_values = self._loss_values(loss_items)
         while len(loss_values) < 4:
             loss_values.append(0.0)
         row = {
@@ -253,6 +253,19 @@ class OdamLiveLogger:
             f"raw_odam={row['raw_odam_loss']:.6g} weighted_odam={row['weighted_odam_loss']:.6g} "
             f"skip={row['skip_reason'] or 'none'}"
         )
+
+    @staticmethod
+    def _loss_values(loss_items: torch.Tensor | Mapping[str, Any]) -> list[float]:
+        if isinstance(loss_items, Mapping):
+            values: list[float] = []
+            for key in ("box_loss", "cls_loss", "dfl_loss", "odam_loss"):
+                value = loss_items.get(key, 0.0)
+                if isinstance(value, torch.Tensor):
+                    values.append(float(value.detach().float().cpu()))
+                else:
+                    values.append(float(value))
+            return values
+        return loss_items.detach().float().cpu().tolist()
 
 
 _LOGGER: OdamLiveLogger | None = None

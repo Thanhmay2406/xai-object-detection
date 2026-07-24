@@ -1,4 +1,5 @@
 import os
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,12 +10,24 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-odam-train")
 
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.tal import make_anchors
+from ultralytics.engine.trainer import BaseTrainer
 
 from .config import OdamConfig
 from .live_logging import get_live_logger
 
 
 FEATURE_ATTR = "_odam_input_features"
+_TRAINER_EXPECTS_DICT_LOSS_ITEMS: bool | None = None
+
+
+def trainer_expects_dict_loss_items() -> bool:
+    global _TRAINER_EXPECTS_DICT_LOSS_ITEMS
+    if _TRAINER_EXPECTS_DICT_LOSS_ITEMS is None:
+        source = inspect.getsource(BaseTrainer._do_train)
+        _TRAINER_EXPECTS_DICT_LOSS_ITEMS = (
+            "self.loss_items.items()" in source or "self.tloss.values()" in source
+        )
+    return bool(_TRAINER_EXPECTS_DICT_LOSS_ITEMS)
 
 
 def get_captured_features(head: torch.nn.Module) -> tuple[torch.Tensor, ...] | None:
@@ -173,9 +186,10 @@ class OdamDetectionLoss(v8DetectionLoss):
                 skip_reason=skip_reason,
             )
 
-        # Ultralytics' trainer sums this vector before backward and logs its
-        # detached components. Multiplication by batch size mirrors v8DetectionLoss.
-        return loss * batch_size, loss.detach()
+        # Multiplication by batch size mirrors v8DetectionLoss. Ultralytics
+        # changed loss_items from a tensor to a dict in newer 8.4.x trainers,
+        # so return the shape the local trainer expects at runtime.
+        return loss * batch_size, self._format_loss_items(loss)
 
     def _current_odam_weight(self) -> float:
         cfg = self.odam_cfg
@@ -186,6 +200,18 @@ class OdamDetectionLoss(v8DetectionLoss):
             return float(cfg.lambda_odam)
         progress = (epoch - cfg.start_epoch + 1) / float(cfg.warmup_epochs)
         return float(cfg.lambda_odam) * max(0.0, min(1.0, progress))
+
+    @staticmethod
+    def _format_loss_items(loss: torch.Tensor) -> torch.Tensor | dict[str, torch.Tensor]:
+        detached = loss.detach()
+        if not trainer_expects_dict_loss_items():
+            return detached
+        return {
+            "box_loss": detached[0],
+            "cls_loss": detached[1],
+            "dfl_loss": detached[2],
+            "odam_loss": detached[3],
+        }
 
     def _should_run_odam(self, weight: float) -> tuple[bool, str]:
         if not self.odam_cfg.enabled:
