@@ -175,6 +175,44 @@ class OdamDetectionLoss(v8DetectionLoss):
     ) -> tuple[torch.Tensor, OdamBatchStats]:
         cfg = self.odam_cfg
         head = self.head
+
+        # TaskAlignedAssigner in Ultralytics 8.3.245 returns:
+        #   target_labels: [B, A]
+        #   fg_mask:       [B, A]
+        #   target_gt_idx: [B, A]
+        # Some nearby Ultralytics/custom variants may retain a trailing
+        # singleton class dimension, so normalize that case explicitly.
+        if target_labels.ndim == 3 and target_labels.shape[-1] == 1:
+            target_labels = target_labels.squeeze(-1)
+
+        expected_assignment_shape = pred_scores.shape[:2]
+        if target_labels.ndim != 2 or tuple(target_labels.shape) != tuple(expected_assignment_shape):
+            raise RuntimeError(
+                "Unexpected target_labels shape: "
+                f"got {tuple(target_labels.shape)}, expected {tuple(expected_assignment_shape)} "
+                "(or the same shape with a trailing singleton dimension)."
+            )
+        if fg_mask.ndim != 2 or tuple(fg_mask.shape) != tuple(expected_assignment_shape):
+            raise RuntimeError(
+                f"Unexpected fg_mask shape: got {tuple(fg_mask.shape)}, "
+                f"expected {tuple(expected_assignment_shape)}."
+            )
+        if target_gt_idx.ndim != 2 or tuple(target_gt_idx.shape) != tuple(expected_assignment_shape):
+            raise RuntimeError(
+                f"Unexpected target_gt_idx shape: got {tuple(target_gt_idx.shape)}, "
+                f"expected {tuple(expected_assignment_shape)}."
+            )
+        if target_bboxes_pixels.ndim != 3 or target_bboxes_pixels.shape[-1] != 4:
+            raise RuntimeError(
+                "Unexpected target_bboxes_pixels shape: "
+                f"got {tuple(target_bboxes_pixels.shape)}, expected [B, A, 4]."
+            )
+        if pred_bboxes_pixels.ndim != 3 or pred_bboxes_pixels.shape[-1] != 4:
+            raise RuntimeError(
+                "Unexpected pred_bboxes_pixels shape: "
+                f"got {tuple(pred_bboxes_pixels.shape)}, expected [B, A, 4]."
+            )
+
         captured = get_captured_features(head)
         if captured is None:
             zero = pred_scores.sum() * 0.0
@@ -207,7 +245,8 @@ class OdamDetectionLoss(v8DetectionLoss):
             assigned_boxes = target_bboxes_pixels[batch_id, pos_anchor_idx]
             assignment_iou = aligned_box_iou(pred_boxes.detach(), assigned_boxes.detach())
             object_ids = target_gt_idx[batch_id, pos_anchor_idx].long()
-            class_ids = target_labels[batch_id, pos_anchor_idx, 0].long().clamp_(0, self.nc - 1)
+            class_ids = target_labels[batch_id, pos_anchor_idx].long()
+            class_ids = class_ids.clamp(min=0, max=self.nc - 1)
 
             keep = assignment_iou >= cfg.min_assignment_iou
             pos_anchor_idx = pos_anchor_idx[keep]
