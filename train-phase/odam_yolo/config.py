@@ -28,6 +28,8 @@ class OdamConfig:
 
     map_height: int = 40
     map_width: int = 40
+    smoothing_kernel: int = 3
+    target_activation: str = "sigmoid"
     negative_overlap_iou: float = 0.0
     include_self_positive: bool = False
     eps: float = 1.0e-6
@@ -67,6 +69,10 @@ class OdamConfig:
             raise ValueError("max_samples_per_object must be >= 1")
         if self.map_height < 1 or self.map_width < 1:
             raise ValueError("ODAM map dimensions must be positive")
+        if self.smoothing_kernel < 1 or self.smoothing_kernel % 2 == 0:
+            raise ValueError("smoothing_kernel must be a positive odd integer")
+        if self.target_activation not in {"raw_logit", "sigmoid"}:
+            raise ValueError("target_activation must be 'raw_logit' or 'sigmoid'")
         if not 0.0 <= self.min_assignment_iou <= 1.0:
             raise ValueError("min_assignment_iou must be in [0, 1]")
         if not 0.0 <= self.negative_overlap_iou <= 1.0:

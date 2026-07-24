@@ -22,7 +22,8 @@ class LiveLoggerTest(unittest.TestCase):
             )
             logger.open()
             logger.start_epoch(0)
-            logger.start_batch()
+            logger.start_batch(epoch=0, batch_index=0, batch_size=2)
+            logger.start_odam(epoch=0, batch_index=0)
             logger.record_batch(
                 epoch=0,
                 batch_index=0,
@@ -46,6 +47,8 @@ class LiveLoggerTest(unittest.TestCase):
 
             live_text = (tmp_path / "odam_live.log").read_text(encoding="utf-8")
             self.assertIn("ODAM live logging enabled", live_text)
+            self.assertIn("batch_start epoch=1 batch=0 batch_size=2", live_text)
+            self.assertIn("odam_start epoch=1 batch=0", live_text)
             self.assertIn("batch epoch=1 batch=0", live_text)
             self.assertIn("fg=7 selected=4 cams=4 pos=2 neg=1", live_text)
 

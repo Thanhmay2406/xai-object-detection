@@ -46,7 +46,11 @@ class OdamDetectionTrainer(DetectionTrainer):
         self._odam_next_batch_index = batch_index + 1
         self._odam_current_batch_size = int(batch["img"].shape[0])
         if self._odam_live_logger is not None:
-            self._odam_live_logger.start_batch()
+            self._odam_live_logger.start_batch(
+                epoch=int(getattr(self, "epoch", 0)),
+                batch_index=batch_index,
+                batch_size=self._odam_current_batch_size,
+            )
         model = unwrap_model(self.model)
         model.model[-1]._odam_current_epoch = int(getattr(self, "epoch", 0))
         model.model[-1]._odam_current_batch_index = batch_index

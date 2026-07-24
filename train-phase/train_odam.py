@@ -92,6 +92,13 @@ def main() -> None:
         # Hooks and autograd.grad are not torch.compile-safe in this package.
         "compile": False,
     }
+    print(
+        "ODAM-Train starting "
+        f"model={args.model} data={args.data} config={odam_path} "
+        f"epochs={args.epochs} batch={args.batch} imgsz={args.imgsz} device={args.device} "
+        f"log_every={args.log_every} detail_batches={args.log_detail_batches}",
+        flush=True,
+    )
     trainer = OdamDetectionTrainer(overrides=overrides)
     trainer.train()
 

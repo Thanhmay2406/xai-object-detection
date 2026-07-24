@@ -157,13 +157,17 @@ class OdamLiveLogger:
             f"mean_total_loss={payload.get('mean_total_loss', 0.0):.6g}"
         )
 
-    def start_batch(self) -> None:
+    def start_batch(self, epoch: int, batch_index: int, batch_size: int) -> None:
         self._batch_start_time = time.perf_counter()
+        if self.should_emit_batch(batch_index):
+            self.line(f"batch_start epoch={epoch + 1} batch={batch_index} batch_size={batch_size}")
 
-    def start_odam(self) -> None:
+    def start_odam(self, epoch: int, batch_index: int) -> None:
         now = time.perf_counter()
         self._odam_start_time = now
         self._last_heartbeat_time = now
+        if self.should_emit_batch(batch_index):
+            self.line(f"odam_start epoch={epoch + 1} batch={batch_index}")
 
     def detail_enabled(self, batch_index: int) -> bool:
         return batch_index < self.config.detail_batches

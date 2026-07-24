@@ -1,16 +1,27 @@
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-odam-train")
+
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.tal import make_anchors
 
 from .config import OdamConfig
-from .feature_tap import get_captured_features
-from .geometry import aligned_box_iou, pairwise_box_iou
 from .live_logging import get_live_logger
+
+
+FEATURE_ATTR = "_odam_input_features"
+
+
+def get_captured_features(head: torch.nn.Module) -> tuple[torch.Tensor, ...] | None:
+    features = getattr(head, FEATURE_ATTR, None)
+    if features is None:
+        return None
+    return tuple(features)
 
 
 @dataclass
@@ -29,8 +40,8 @@ class OdamBatchStats:
 class OdamDetectionLoss(v8DetectionLoss):
     """Ultralytics YOLOv8 detection loss plus ODAM pair discrimination loss.
 
-    The detection part intentionally mirrors ``v8DetectionLoss`` from
-    Ultralytics 8.3.245. The additional ODAM term uses TaskAlignedAssigner's
+    The detection part intentionally mirrors ``v8DetectionLoss`` from the
+    local Ultralytics runtime. The additional ODAM term uses TaskAlignedAssigner's
     foreground assignments, chooses high-IoU predictions, generates one
     instance-specific map per selected prediction, and applies the BCE pair
     objective released by the ODAM authors.
@@ -62,15 +73,20 @@ class OdamDetectionLoss(v8DetectionLoss):
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         # box, cls, dfl, weighted_odam
         loss = torch.zeros(4, device=self.device)
-        feats = preds[1] if isinstance(preds, tuple) else preds
-        if not isinstance(feats, (list, tuple)):
-            raise TypeError(f"Expected training feature outputs, got {type(feats)!r}")
-
-        pred_distri, pred_scores = torch.cat(
-            [xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2
-        ).split((self.reg_max * 4, self.nc), 1)
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
-        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        parsed = self.parse_output(preds) if hasattr(self, "parse_output") else preds
+        if isinstance(parsed, dict):
+            feats = parsed["feats"]
+            pred_distri = parsed["boxes"].permute(0, 2, 1).contiguous()
+            pred_scores = parsed["scores"].permute(0, 2, 1).contiguous()
+        else:
+            feats = parsed[1] if isinstance(parsed, tuple) else parsed
+            if not isinstance(feats, (list, tuple)):
+                raise TypeError(f"Expected training feature outputs, got {type(feats)!r}")
+            pred_distri, pred_scores = torch.cat(
+                [xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2
+            ).split((self.reg_max * 4, self.nc), 1)
+            pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+            pred_distri = pred_distri.permute(0, 2, 1).contiguous()
 
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
@@ -101,17 +117,34 @@ class OdamDetectionLoss(v8DetectionLoss):
         target_scores_sum = target_scores.sum().clamp_min(1.0)
 
         # Standard YOLOv8 detection losses.
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        bce_loss = self.bce(pred_scores, target_scores.to(dtype))
+        class_weights = getattr(self, "class_weights", None)
+        if class_weights is not None:
+            bce_loss *= class_weights
+        loss[1] = bce_loss.sum() / target_scores_sum
         if fg_mask.sum():
-            loss[0], loss[2] = self.bbox_loss(
-                pred_distri,
-                pred_bboxes,
-                anchor_points,
-                target_bboxes / stride_tensor,
-                target_scores,
-                target_scores_sum,
-                fg_mask,
-            )
+            try:
+                loss[0], loss[2] = self.bbox_loss(
+                    pred_distri,
+                    pred_bboxes,
+                    anchor_points,
+                    target_bboxes / stride_tensor,
+                    target_scores,
+                    target_scores_sum,
+                    fg_mask,
+                    imgsz,
+                    stride_tensor,
+                )
+            except TypeError:
+                loss[0], loss[2] = self.bbox_loss(
+                    pred_distri,
+                    pred_bboxes,
+                    anchor_points,
+                    target_bboxes / stride_tensor,
+                    target_scores,
+                    target_scores_sum,
+                    fg_mask,
+                )
         loss[0] *= self.hyp.box
         loss[1] *= self.hyp.cls
         loss[2] *= self.hyp.dfl
@@ -249,7 +282,7 @@ class OdamDetectionLoss(v8DetectionLoss):
         batch_index = int(getattr(head, "_odam_current_batch_index", -1))
         detail_enabled = logger is not None and logger.detail_enabled(batch_index)
         if logger is not None:
-            logger.start_odam()
+            logger.start_odam(epoch, batch_index)
 
         for batch_id in range(pred_scores.shape[0]):
             pos_anchor_idx = torch.nonzero(fg_mask[batch_id], as_tuple=False).flatten()
@@ -325,9 +358,10 @@ class OdamDetectionLoss(v8DetectionLoss):
                     )
                 feature = captured[level]
                 score = pred_scores[batch_id, anchor_idx, class_idx]
+                target = score.sigmoid() if cfg.target_activation == "sigmoid" else score
 
                 grad = torch.autograd.grad(
-                    outputs=score,
+                    outputs=target,
                     inputs=feature,
                     retain_graph=True,
                     create_graph=cfg.second_order,
@@ -343,6 +377,7 @@ class OdamDetectionLoss(v8DetectionLoss):
                         )
                     continue
                 grad_for_cam = grad[batch_id] if cfg.second_order else grad[batch_id].detach()
+                grad_for_cam = self._smooth_gradient(grad_for_cam, cfg.smoothing_kernel)
                 cam = (feature[batch_id].float() * grad_for_cam.float()).sum(dim=0)
                 cam = F.relu(cam)
                 cam = F.interpolate(
@@ -483,3 +518,64 @@ class OdamDetectionLoss(v8DetectionLoss):
         if not terms:
             return cams.sum() * 0.0, 0, 0
         return torch.stack(terms).mean(), positive_count, negative_count
+
+    @staticmethod
+    def _smooth_gradient(grad: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        """Apply the local ODAM smoothing Phi from the paper.
+
+        The paper uses a Gaussian kernel whose size can depend on object scale.
+        For YOLOv8-P2 training, a fixed grouped Gaussian is a stable, minimal
+        adaptation that preserves spatial gradients while reducing pixel noise.
+        """
+
+        if kernel_size <= 1:
+            return grad
+        channels = int(grad.shape[0])
+        device = grad.device
+        dtype = grad.dtype
+        radius = kernel_size // 2
+        coords = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+        sigma = max(float(kernel_size) / 3.0, 1.0e-6)
+        one_d = torch.exp(-(coords**2) / (2.0 * sigma * sigma))
+        one_d = one_d / one_d.sum().clamp_min(1.0e-12)
+        kernel = (one_d[:, None] * one_d[None, :]).view(1, 1, kernel_size, kernel_size)
+        kernel = kernel.expand(channels, 1, kernel_size, kernel_size)
+        return F.conv2d(grad[None], kernel, padding=radius, groups=channels)[0]
+
+
+def aligned_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    """IoU for aligned XYXY boxes with shape ``[N, 4]``."""
+
+    if boxes1.shape != boxes2.shape or boxes1.ndim != 2 or boxes1.shape[-1] != 4:
+        raise ValueError(f"Expected aligned [N,4] boxes, got {boxes1.shape} and {boxes2.shape}")
+    lt = torch.maximum(boxes1[:, :2], boxes2[:, :2])
+    rb = torch.minimum(boxes1[:, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp_min(0)
+    inter = wh[:, 0] * wh[:, 1]
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp_min(0) * (
+        boxes1[:, 3] - boxes1[:, 1]
+    ).clamp_min(0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp_min(0) * (
+        boxes2[:, 3] - boxes2[:, 1]
+    ).clamp_min(0)
+    return inter / (area1 + area2 - inter).clamp_min(eps)
+
+
+def pairwise_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    """Pairwise IoU for two XYXY box collections."""
+
+    if boxes1.ndim != 2 or boxes2.ndim != 2 or boxes1.shape[-1] != 4 or boxes2.shape[-1] != 4:
+        raise ValueError("pairwise_box_iou expects [N,4] and [M,4]")
+    lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    wh = (rb - lt).clamp_min(0)
+    inter = wh[..., 0] * wh[..., 1]
+    area1 = (
+        (boxes1[:, 2] - boxes1[:, 0]).clamp_min(0)
+        * (boxes1[:, 3] - boxes1[:, 1]).clamp_min(0)
+    )[:, None]
+    area2 = (
+        (boxes2[:, 2] - boxes2[:, 0]).clamp_min(0)
+        * (boxes2[:, 3] - boxes2[:, 1]).clamp_min(0)
+    )[None, :]
+    return inter / (area1 + area2 - inter).clamp_min(eps)

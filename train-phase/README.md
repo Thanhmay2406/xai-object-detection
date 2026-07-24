@@ -9,7 +9,7 @@ box/classification/DFL loss vector.
 
 ## Reproducible environment
 
-This package targets **Ultralytics 8.3.245**. Do not silently upgrade the
+This package is validated in this workspace with **Ultralytics 8.4.75**. Do not silently upgrade the
 Ultralytics package because the internal trainer, Detect head, and loss APIs are
 not a stable public extension interface.
 
@@ -23,7 +23,7 @@ pip install -r requirements.txt
 On Kaggle, PyTorch is already installed, so usually this is enough:
 
 ```bash
-pip install -q ultralytics==8.3.245 PyYAML
+pip install -q ultralytics==8.4.75 PyYAML
 ```
 
 ## 1. Verify the P2 checkpoint
@@ -156,9 +156,12 @@ For each image:
 1. TaskAlignedAssigner supplies foreground anchors and assigned GT identities.
 2. Positive predictions are sorted by predicted-box/assigned-GT IoU.
 3. At most `max_samples_per_object` and `max_samples_per_image` are retained.
-4. For each prediction, the raw class logit is differentiated with respect to
-   its corresponding P-level feature map.
-5. The ODAM vector is `ReLU(sum_c(feature_c * gradient_c))`, resized and L2
+4. For each prediction, the configured target score is differentiated with
+   respect to its corresponding P-level feature map. The default target is
+   `sigmoid(class_logit)`, matching the paper's confidence-score target more
+   closely than a raw logit for YOLOv8.
+5. The gradient map is locally smoothed with a grouped Gaussian `Phi`, then the
+   ODAM vector is `ReLU(sum_c(feature_c * Phi(gradient_c)))`, resized and L2
    normalized.
 6. The highest-IoU prediction of each GT is the reference.
 7. Same-GT maps are pushed toward cosine similarity 1.
@@ -168,6 +171,10 @@ For each image:
 The default `second_order: false` detaches the gradient term. This matches the
 released author's Odam-Train implementation and avoids a costly Hessian-vector
 backward. Setting `second_order: true` is experimental and changes the method.
+
+The logger writes to both stdout and files. It now emits `batch_start` before
+preprocessing enters the model and `odam_start` before CAM generation, so long
+ODAM batches no longer look silent while `autograd.grad` is running.
 
 ## Important limitations
 
