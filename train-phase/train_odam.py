@@ -6,6 +6,16 @@ from typing import Any
 from odam_yolo.trainer import OdamDetectionTrainer
 
 
+def prepend_pythonpath(path: Path) -> None:
+    """Expose this local package to Ultralytics DDP worker subprocesses."""
+
+    resolved = str(path.resolve())
+    current = os.environ.get("PYTHONPATH", "")
+    entries = [entry for entry in current.split(os.pathsep) if entry]
+    if resolved not in entries:
+        os.environ["PYTHONPATH"] = os.pathsep.join([resolved, *entries])
+
+
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -61,6 +71,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    train_phase_dir = Path(__file__).resolve().parent
+    prepend_pythonpath(train_phase_dir)
+
     odam_path = Path(args.odam_config).expanduser().resolve()
     if not odam_path.is_file():
         raise FileNotFoundError(f"ODAM config not found: {odam_path}")
