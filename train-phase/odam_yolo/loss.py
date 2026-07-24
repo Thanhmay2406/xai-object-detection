@@ -10,13 +10,16 @@ from ultralytics.utils.tal import make_anchors
 from .config import OdamConfig
 from .feature_tap import get_captured_features
 from .geometry import aligned_box_iou, pairwise_box_iou
+from .live_logging import get_live_logger
 
 
 @dataclass
 class OdamBatchStats:
     raw_loss: float = 0.0
     weighted_loss: float = 0.0
+    foreground_anchors: int = 0
     selected_predictions: int = 0
+    cam_count: int = 0
     positive_pairs: int = 0
     negative_pairs: int = 0
     skipped: bool = False
@@ -131,7 +134,11 @@ class OdamDetectionLoss(v8DetectionLoss):
             stats.weighted_loss = float(loss[3].detach())
             self.last_stats = stats
         else:
-            self.last_stats = OdamBatchStats(skipped=True, skip_reason=skip_reason)
+            self.last_stats = OdamBatchStats(
+                foreground_anchors=int(fg_mask.sum().detach().item()),
+                skipped=True,
+                skip_reason=skip_reason,
+            )
 
         # Ultralytics' trainer sums this vector before backward and logs its
         # detached components. Multiplication by batch size mirrors v8DetectionLoss.
@@ -232,13 +239,29 @@ class OdamDetectionLoss(v8DetectionLoss):
             level_ends.append(start)
 
         image_losses: list[torch.Tensor] = []
+        total_foreground = int(fg_mask.sum().detach().item())
         total_selected = 0
+        total_cams = 0
         total_pos_pairs = 0
         total_neg_pairs = 0
+        logger = get_live_logger()
+        epoch = int(getattr(head, "_odam_current_epoch", 0))
+        batch_index = int(getattr(head, "_odam_current_batch_index", -1))
+        detail_enabled = logger is not None and logger.detail_enabled(batch_index)
+        if logger is not None:
+            logger.start_odam()
 
         for batch_id in range(pred_scores.shape[0]):
             pos_anchor_idx = torch.nonzero(fg_mask[batch_id], as_tuple=False).flatten()
+            if logger is not None:
+                logger.heartbeat(
+                    epoch,
+                    batch_index,
+                    f"image={batch_id} stage=foreground anchors={int(pos_anchor_idx.numel())}",
+                )
             if pos_anchor_idx.numel() == 0:
+                if detail_enabled:
+                    logger.detail(epoch, batch_index, batch_id, "skip=no_foreground_anchors")
                 continue
 
             pred_boxes = pred_bboxes_pixels[batch_id, pos_anchor_idx]
@@ -255,6 +278,8 @@ class OdamDetectionLoss(v8DetectionLoss):
             object_ids = object_ids[keep]
             class_ids = class_ids[keep]
             if pos_anchor_idx.numel() == 0:
+                if detail_enabled:
+                    logger.detail(epoch, batch_index, batch_id, "skip=no_anchor_after_iou_gate")
                 continue
 
             selected = self._select_predictions(object_ids, assignment_iou)
@@ -263,6 +288,17 @@ class OdamDetectionLoss(v8DetectionLoss):
             assignment_iou = assignment_iou[selected]
             object_ids = object_ids[selected]
             class_ids = class_ids[selected]
+            total_selected += int(pos_anchor_idx.numel())
+            if detail_enabled:
+                logger.detail(
+                    epoch,
+                    batch_index,
+                    batch_id,
+                    "selected "
+                    f"foreground={int(fg_mask[batch_id].sum().detach().item())} "
+                    f"after_iou={int(keep.sum().detach().item())} "
+                    f"predictions={int(pos_anchor_idx.numel())}",
+                )
 
             cams: list[torch.Tensor] = []
             valid_rows: list[int] = []
@@ -270,6 +306,23 @@ class OdamDetectionLoss(v8DetectionLoss):
                 anchor_idx = int(anchor_idx_t.item())
                 class_idx = int(class_idx_t.item())
                 level = self._anchor_level(anchor_idx, level_starts, level_ends)
+                if detail_enabled:
+                    logger.detail(
+                        epoch,
+                        batch_index,
+                        batch_id,
+                        "cam_start "
+                        f"cam={row + 1}/{int(pos_anchor_idx.numel())} "
+                        f"level={level} anchor={anchor_idx} class={class_idx}",
+                    )
+                if logger is not None:
+                    logger.heartbeat(
+                        epoch,
+                        batch_index,
+                        "stage=cam "
+                        f"image={batch_id} cam={row + 1}/{int(pos_anchor_idx.numel())} "
+                        f"level={level}",
+                    )
                 feature = captured[level]
                 score = pred_scores[batch_id, anchor_idx, class_idx]
 
@@ -281,6 +334,13 @@ class OdamDetectionLoss(v8DetectionLoss):
                     allow_unused=True,
                 )[0]
                 if grad is None:
+                    if detail_enabled:
+                        logger.detail(
+                            epoch,
+                            batch_index,
+                            batch_id,
+                            f"cam_skip cam={row + 1}/{int(pos_anchor_idx.numel())} reason=grad_none",
+                        )
                     continue
                 grad_for_cam = grad[batch_id] if cfg.second_order else grad[batch_id].detach()
                 cam = (feature[batch_id].float() * grad_for_cam.float()).sum(dim=0)
@@ -295,8 +355,18 @@ class OdamDetectionLoss(v8DetectionLoss):
                 cam = cam / cam.norm(p=2).clamp_min(cfg.eps)
                 cams.append(cam)
                 valid_rows.append(row)
+                total_cams += 1
+                if detail_enabled:
+                    logger.detail(
+                        epoch,
+                        batch_index,
+                        batch_id,
+                        f"cam_done cam={row + 1}/{int(pos_anchor_idx.numel())}",
+                    )
 
             if not cams:
+                if detail_enabled:
+                    logger.detail(epoch, batch_index, batch_id, "skip=no_valid_cams")
                 continue
 
             valid = torch.tensor(valid_rows, device=object_ids.device, dtype=torch.long)
@@ -313,16 +383,26 @@ class OdamDetectionLoss(v8DetectionLoss):
             )
             if pos_count + neg_count > 0:
                 image_losses.append(pair_loss)
-                total_selected += int(cam_tensor.shape[0])
                 total_pos_pairs += pos_count
                 total_neg_pairs += neg_count
+                if detail_enabled:
+                    logger.detail(
+                        epoch,
+                        batch_index,
+                        batch_id,
+                        f"pairs positive={pos_count} negative={neg_count}",
+                    )
+            elif detail_enabled:
+                logger.detail(epoch, batch_index, batch_id, "skip=no_positive_or_negative_pairs")
 
         if not image_losses:
             # Keep a valid graph-connected zero for all batches where ODAM has
             # no eligible pair, rather than returning a detached scalar.
             zero = sum(feature.sum() * 0.0 for feature in captured)
             return zero, OdamBatchStats(
+                foreground_anchors=total_foreground,
                 selected_predictions=total_selected,
+                cam_count=total_cams,
                 positive_pairs=total_pos_pairs,
                 negative_pairs=total_neg_pairs,
                 skipped=True,
@@ -331,7 +411,9 @@ class OdamDetectionLoss(v8DetectionLoss):
 
         raw_loss = torch.stack(image_losses).mean()
         return raw_loss, OdamBatchStats(
+            foreground_anchors=total_foreground,
             selected_predictions=total_selected,
+            cam_count=total_cams,
             positive_pairs=total_pos_pairs,
             negative_pairs=total_neg_pairs,
         )

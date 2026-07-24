@@ -59,6 +59,15 @@ A permanently zero value can be valid for individual batches with no eligible
 pairs, but it should not remain zero across a dataset containing multiple
 positive predictions per object or overlapping objects.
 
+The smoke run writes live ODAM diagnostics into the Ultralytics run directory:
+
+```text
+runs/odam_smoke/gradient_connectivity/odam_live.log
+runs/odam_smoke/gradient_connectivity/odam_batches.csv
+runs/odam_smoke/gradient_connectivity/odam_batches.jsonl
+runs/odam_smoke/gradient_connectivity/odam_epochs.jsonl
+```
+
 ## 3. Full single-GPU run
 
 ```bash
@@ -74,7 +83,10 @@ python train_odam.py \
   --amp true \
   --project experiments/odam \
   --name odam_seed0 \
-  --seed 0
+  --seed 0 \
+  --log-every 1 \
+  --log-detail-batches 3 \
+  --heartbeat-seconds 20
 ```
 
 ## 4. Two-GPU run
@@ -94,11 +106,42 @@ python train_odam.py \
   --amp true \
   --project experiments/odam \
   --name odam_seed0_ddp \
-  --seed 0
+  --seed 0 \
+  --log-every 1 \
+  --log-detail-batches 3 \
+  --heartbeat-seconds 20
 ```
 
 `batch=16` is the global batch size handled by Ultralytics; with two GPUs it is
 normally divided between the two ranks.
+
+Only rank 0 writes the live diagnostics in DDP, so terminal output and the four
+ODAM log files are not duplicated across workers.
+
+## Live logging
+
+The ODAM integration adds flush-on-write logging without changing the detector,
+matching, loss formula, optimizer, or training control flow. Batch summaries are
+printed to stdout and appended to `odam_live.log`, `odam_batches.csv`, and
+`odam_batches.jsonl`. Epoch aggregates are appended to `odam_epochs.jsonl`.
+
+Each batch line includes epoch, batch index, `box_loss`, `cls_loss`, `dfl_loss`,
+`odam_loss`, total loss, learning rate, GPU memory, batch time, throughput,
+foreground anchors, selected predictions, generated CAM count, positive pairs,
+negative pairs, raw ODAM loss, weighted ODAM loss, and skip reason.
+
+The first `--log-detail-batches` batches of each epoch also emit per-image
+foreground/selection lines and CAM start/done progress. If ODAM CAM generation
+runs longer than `--heartbeat-seconds`, rank 0 prints `odam_heartbeat` lines so
+Kaggle notebooks do not look stalled.
+
+Useful controls:
+
+```bash
+--log-every 1              # write every batch summary
+--log-detail-batches 3     # verbose image/CAM detail for first 3 batches/epoch
+--heartbeat-seconds 20     # heartbeat while a slow ODAM batch is running
+```
 
 ## Loss definition
 

@@ -15,5 +15,8 @@ python train_odam.py \
   --workers 0 \
   --amp false \
   --fraction 0.02 \
+  --log-every 1 \
+  --log-detail-batches 3 \
+  --heartbeat-seconds 20 \
   --project runs/odam_smoke \
   --name gradient_connectivity

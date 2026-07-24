@@ -43,6 +43,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--save-period", type=int, default=-1)
+    parser.add_argument("--log-every", type=int, default=1, help="Emit live batch logs every N batches")
+    parser.add_argument(
+        "--log-detail-batches",
+        type=int,
+        default=3,
+        help="Emit per-image/CAM detail for the first N batches of each epoch",
+    )
+    parser.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=20.0,
+        help="Emit an ODAM heartbeat when CAM generation exceeds this many seconds",
+    )
     return parser.parse_args()
 
 
@@ -52,6 +65,9 @@ def main() -> None:
     if not odam_path.is_file():
         raise FileNotFoundError(f"ODAM config not found: {odam_path}")
     os.environ["ODAM_CONFIG_PATH"] = str(odam_path)
+    os.environ["ODAM_LOG_EVERY"] = str(max(1, args.log_every))
+    os.environ["ODAM_LOG_DETAIL_BATCHES"] = str(max(0, args.log_detail_batches))
+    os.environ["ODAM_HEARTBEAT_SECONDS"] = str(max(0.0, args.heartbeat_seconds))
 
     overrides: dict[str, Any] = {
         "model": args.model,
