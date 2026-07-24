@@ -1,5 +1,7 @@
 import argparse
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,49 @@ def prepend_pythonpath(path: Path) -> None:
     entries = [entry for entry in current.split(os.pathsep) if entry]
     if resolved not in entries:
         os.environ["PYTHONPATH"] = os.pathsep.join([resolved, *entries])
+
+
+class LiveLogTailer:
+    """Mirror rank-zero ODAM file logs back to the parent process during DDP."""
+
+    def __init__(self, path: Path, interval: float = 1.0):
+        self.path = path
+        self.interval = max(0.1, float(interval))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="odam-log-tail", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        seek_to_end = self.path.exists()
+        while not self._stop.is_set():
+            if not self.path.exists():
+                time.sleep(self.interval)
+                continue
+            try:
+                with self.path.open("r", encoding="utf-8", errors="replace") as handle:
+                    if seek_to_end:
+                        handle.seek(0, os.SEEK_END)
+                        seek_to_end = False
+                    while not self._stop.is_set():
+                        line = handle.readline()
+                        if line:
+                            print(line.rstrip("\n"), flush=True)
+                        else:
+                            time.sleep(self.interval)
+            except OSError as exc:
+                print(f"ODAM live log tail waiting: {exc}", flush=True)
+                time.sleep(self.interval)
+
+
+def is_multi_device(device: str) -> bool:
+    normalized = str(device).strip().lower()
+    return "," in normalized and normalized not in {"cpu", "mps"}
 
 
 def str_to_bool(value: str | bool) -> bool:
@@ -54,6 +99,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--save-period", type=int, default=-1)
     parser.add_argument("--log-every", type=int, default=1, help="Emit live batch logs every N batches")
+    parser.add_argument(
+        "--tail-live-log",
+        type=str_to_bool,
+        default=True,
+        help="In multi-GPU DDP, mirror odam_live.log to the parent process stdout.",
+    )
+    parser.add_argument(
+        "--tail-live-log-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between DDP live-log tail polls.",
+    )
     parser.add_argument(
         "--log-detail-batches",
         type=int,
@@ -113,7 +170,17 @@ def main() -> None:
         flush=True,
     )
     trainer = OdamDetectionTrainer(overrides=overrides)
-    trainer.train()
+    tailer: LiveLogTailer | None = None
+    if args.tail_live_log and is_multi_device(args.device):
+        live_log_path = Path(trainer.save_dir) / "odam_live.log"
+        print(f"ODAM DDP live log mirror watching {live_log_path}", flush=True)
+        tailer = LiveLogTailer(live_log_path, interval=args.tail_live_log_interval)
+        tailer.start()
+    try:
+        trainer.train()
+    finally:
+        if tailer is not None:
+            tailer.stop()
 
 
 if __name__ == "__main__":

@@ -115,8 +115,11 @@ python train_odam.py \
 `batch=16` is the global batch size handled by Ultralytics; with two GPUs it is
 normally divided between the two ranks.
 
-Only rank 0 writes the live diagnostics in DDP, so terminal output and the four
-ODAM log files are not duplicated across workers.
+Only rank 0 writes the live diagnostics in DDP, so the four ODAM log files are
+not duplicated across workers. Kaggle often buffers or hides worker stdout, so
+`train_odam.py` mirrors rank-zero `odam_live.log` back to the parent process by
+default when `--device` contains multiple GPUs. Disable this with
+`--tail-live-log false` if the parent-process tail is not wanted.
 
 ## Live logging
 
@@ -141,6 +144,7 @@ Useful controls:
 --log-every 1              # write every batch summary
 --log-detail-batches 3     # verbose image/CAM detail for first 3 batches/epoch
 --heartbeat-seconds 20     # heartbeat while a slow ODAM batch is running
+--tail-live-log true       # mirror rank-zero file logs to stdout in DDP
 ```
 
 ## Loss definition
