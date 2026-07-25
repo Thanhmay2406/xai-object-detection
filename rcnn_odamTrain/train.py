@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image
+from torch.nn.modules.batchnorm import _BatchNorm
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
@@ -57,6 +58,14 @@ class TrainConfig:
     rcnn_bg_threshold: float
     rpn_anchor_sizes: list[int]
     rpn_anchor_ratios: list[float]
+    rcnn_nms_threshold: float = 0.5
+    rcnn_detections_per_image: int = 100
+    odam_loss_weight: float = 1.0
+    odam_smooth_kernel: int = 3
+    odam_create_graph: bool = True
+    odam_use_confidence_target: bool = True
+    odam_exclude_gt_rois: bool = True
+    backbone_weights: str = "none"
 
 
 class CocoDrillBitDataset(Dataset):
@@ -206,6 +215,14 @@ def make_config(args, mapping):
         rcnn_bg_threshold=0.5,
         rpn_anchor_sizes=args.rpn_anchor_sizes,
         rpn_anchor_ratios=[0.5, 1.0, 2.0],
+        rcnn_nms_threshold=args.rcnn_nms_threshold,
+        rcnn_detections_per_image=args.rcnn_detections_per_image,
+        odam_loss_weight=args.odam_loss_weight,
+        odam_smooth_kernel=args.odam_smooth_kernel,
+        odam_create_graph=args.odam_create_graph,
+        odam_use_confidence_target=args.odam_use_confidence_target,
+        odam_exclude_gt_rois=args.odam_exclude_gt_rois,
+        backbone_weights=args.backbone_weights,
     )
 
 
@@ -411,11 +428,17 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, rank=
     return {key: value / max(1, len(loader)) for key, value in totals.items()} | {"seconds": seconds}
 
 
+def freeze_batchnorm_for_loss_eval(module):
+    if isinstance(module, _BatchNorm):
+        module.eval()
+
+
 def validate_loss(model, loader, device, args, phase="valid"):
     if loader is None:
         return {}
     was_training = model.training
     model.train()
+    model.apply(freeze_batchnorm_for_loss_eval)
     totals = {}
     max_batches = args.val_batches
     start = time.perf_counter()
@@ -441,6 +464,8 @@ def validate_loss(model, loader, device, args, phase="valid"):
             break
     if not was_training:
         model.eval()
+    else:
+        model.train()
     denom = max(1, step if "step" in locals() else 0)
     metrics = {key: value / denom for key, value in totals.items()}
     print(
@@ -696,7 +721,35 @@ def parse_args():
     )
     parser.add_argument("--max-val-coco-images", type=int, default=None)
     parser.add_argument("--backbone-freeze-at", type=int, default=0)
+    parser.add_argument(
+        "--backbone-weights",
+        choices=("none", "random", "scratch", "default", "coco", "imagenet", "pretrained"),
+        default="none",
+        help="Use default/pretrained to align the backbone initialization with pretrained baselines.",
+    )
     parser.add_argument("--pred-cls-threshold", type=float, default=0.05)
+    parser.add_argument("--rcnn-nms-threshold", type=float, default=0.5)
+    parser.add_argument("--rcnn-detections-per-image", type=int, default=100)
+    parser.add_argument("--odam-loss-weight", type=float, default=1.0)
+    parser.add_argument("--odam-smooth-kernel", type=int, default=3)
+    parser.add_argument(
+        "--odam-create-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep ODAM gradient maps differentiable so the auxiliary loss can optimize them.",
+    )
+    parser.add_argument(
+        "--odam-use-confidence-target",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use softmax confidence scores, not raw logits, as ODAM explanation targets.",
+    )
+    parser.add_argument(
+        "--odam-exclude-gt-rois",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude GT-appended ROIs from the ODAM auxiliary pair loss.",
+    )
     parser.add_argument("--rpn-pre-nms-topk", type=int, default=1000)
     parser.add_argument("--rpn-post-nms-topk", type=int, default=300)
     parser.add_argument("--rcnn-batch-size", type=int, default=128)
@@ -718,6 +771,14 @@ def main():
         raise ValueError("--max-val-coco-images must be >= 1")
     if args.eval_coco_every < 0:
         raise ValueError("--eval-coco-every must be >= 0")
+    if not 0.0 <= args.rcnn_nms_threshold <= 1.0:
+        raise ValueError("--rcnn-nms-threshold must be in [0, 1]")
+    if args.rcnn_detections_per_image < 1:
+        raise ValueError("--rcnn-detections-per-image must be >= 1")
+    if args.odam_loss_weight < 0.0:
+        raise ValueError("--odam-loss-weight must be >= 0")
+    if args.odam_smooth_kernel < 1:
+        raise ValueError("--odam-smooth-kernel must be >= 1")
     distributed = setup_distributed(should_enable_distributed(args.distributed))
     seed_everything(args.seed)
     try:

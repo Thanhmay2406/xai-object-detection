@@ -5,7 +5,7 @@ from torch import nn
 from torch import autograd
 import torch.nn.functional as F
 from torchvision import transforms
-from torchvision.ops import roi_align
+from torchvision.ops import batched_nms, roi_align
 import numpy as np
 
 from backbone.resnet50 import ResNet50
@@ -23,7 +23,11 @@ class Network(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.resnet50 = ResNet50(config.backbone_freeze_at, False)
+        self.resnet50 = ResNet50(
+            config.backbone_freeze_at,
+            False,
+            weights=getattr(config, "backbone_weights", "none"),
+        )
         self.FPN = FPN(self.resnet50, 2, 6)
         self.RPN = RPN(config)
         self.RCNN = RCNN(config)
@@ -47,10 +51,10 @@ class Network(nn.Module):
         rpn_rois, loss_dict_rpn = self.RPN(fpn_fms, im_info, gt_boxes)
 
         # top_k=1: for each rpn_roi, only assign the gt object which fits it best 
-        rcnn_rois, rcnn_labels, rcnn_bbox_targets, rcnn_gts = fpn_roi_target(
-                config, rpn_rois, im_info, gt_boxes, top_k=1)
+        rcnn_rois, rcnn_labels, rcnn_bbox_targets, rcnn_gts, rcnn_roi_is_gt = fpn_roi_target(
+                config, rpn_rois, im_info, gt_boxes, top_k=1, return_roi_is_gt=True)
         loss_dict_rcnn = self.RCNN(fpn_fms, rcnn_rois,
-                rcnn_labels, rcnn_bbox_targets, rcnn_gts)
+                rcnn_labels, rcnn_bbox_targets, rcnn_gts, rcnn_roi_is_gt)
         loss_dict.update(loss_dict_rpn)
         loss_dict.update(loss_dict_rcnn)
         return loss_dict
@@ -84,7 +88,7 @@ class RCNN(nn.Module):
             nn.init.constant_(l.bias, 0)
 
     @torch.enable_grad()
-    def forward(self, fpn_fms, rcnn_rois, labels=None, bbox_targets=None, assigned_gts=None):
+    def forward(self, fpn_fms, rcnn_rois, labels=None, bbox_targets=None, assigned_gts=None, roi_is_gt=None):
         config = self.config
         bbox_stds, bbox_means = config.bbox_normalize_stds, config.bbox_normalize_means
         # input p2-p5
@@ -111,6 +115,10 @@ class RCNN(nn.Module):
 
         if self.training:
             labels = labels.long().flatten()  # class
+            if roi_is_gt is None:
+                roi_is_gt = torch.zeros_like(labels, dtype=torch.bool)
+            else:
+                roi_is_gt = roi_is_gt.bool().flatten()
             fg_masks = labels > 0
             valid_masks = labels >= 0
             fg_gt_classes = labels[fg_masks]
@@ -119,36 +127,64 @@ class RCNN(nn.Module):
             # multi class
             pred_delta = pred_delta.reshape(-1, config.num_classes, 4)
             if fg_masks.any():
-                pred_delta = pred_delta[fg_masks, fg_gt_classes, :]
+                pred_delta_fg = pred_delta[fg_masks, fg_gt_classes, :]
                 localization_loss = smooth_l1_loss(
-                    pred_delta,
+                    pred_delta_fg,
                     bbox_targets[fg_masks],
                     config.rcnn_smooth_l1_beta)
 
-                pred_bbox = restore_bbox(rcnn_rois[fg_masks], pred_delta,
+                pred_bbox = restore_bbox(rcnn_rois[fg_masks, 1:5], pred_delta_fg,
                     bbox_stds, bbox_means, True)
 
                 # loss for iou prediction
-                gt_bbox = restore_bbox(rcnn_rois[fg_masks], bbox_targets[fg_masks],
+                gt_bbox = restore_bbox(rcnn_rois[fg_masks, 1:5], bbox_targets[fg_masks],
                         bbox_stds, bbox_means, True)
                 pred_gt_ious = paired_box_overlap_opr(pred_bbox, gt_bbox)
 
-                # get pool grads for fg samples
-                fg_inds = fg_masks.nonzero(as_tuple=True)[0]
-                pool_grads = self.get_gradient(pred_cls, pool_features) # N, C-1, 256, 7,7
-                pool_dams = F.relu((pool_grads[fg_inds, fg_gt_classes-1,:,:,:] *
-                    pool_features[fg_masks]).sum(1)) # Num_pred,7,7
+                odam_masks = fg_masks
+                if getattr(config, "odam_exclude_gt_rois", True):
+                    odam_masks = fg_masks & ~roi_is_gt
+                if odam_masks.any():
+                    odam_gt_classes = labels[odam_masks]
+                    odam_delta = pred_delta[odam_masks, odam_gt_classes, :]
+                    odam_pred_bbox = restore_bbox(rcnn_rois[odam_masks, 1:5], odam_delta,
+                        bbox_stds, bbox_means, True)
+                    odam_gt_bbox = restore_bbox(rcnn_rois[odam_masks, 1:5], bbox_targets[odam_masks],
+                            bbox_stds, bbox_means, True)
+                    odam_pred_gt_ious = paired_box_overlap_opr(odam_pred_bbox, odam_gt_bbox)
 
-                dam_size = fpn_fms[2].size()[-2:] # image_size // 16
-                rois_fg = rcnn_rois[fg_masks, 1:5]
-                bids = rcnn_rois[fg_masks, 0].long()
-                level_assignments_fg = level_assignments[fg_masks]
+                    target_scores = F.softmax(pred_cls, dim=-1) if getattr(config, "odam_use_confidence_target", True) else pred_cls
+                    pool_grads = self.get_gradient(
+                        target_scores,
+                        pool_features,
+                        create_graph=getattr(config, "odam_create_graph", True),
+                    ) # N, C-1, 256, 7,7
+                    pool_grads = smooth_pool_grads(
+                        pool_grads,
+                        int(getattr(config, "odam_smooth_kernel", 3)),
+                    )
+                    odam_inds = odam_masks.nonzero(as_tuple=True)[0]
+                    pool_dams = F.relu((pool_grads[odam_inds, odam_gt_classes-1,:,:,:] *
+                        pool_features[odam_masks]).sum(1)) # Num_pred,7,7
 
-                pred_dams = get_dams(
-                    pool_dams, bids, rois_fg, fpn_fms, stride, level_assignments_fg, dam_size)
+                    dam_size = fpn_fms[2].size()[-2:] # image_size // 16
+                    rois_odam = rcnn_rois[odam_masks, 1:5]
+                    bids = rcnn_rois[odam_masks, 0].long()
+                    level_assignments_odam = level_assignments[odam_masks]
 
-                assigned_gts_fg = assigned_gts[fg_masks]
-                loss_rcnn_match = match_loss(pred_dams, assigned_gts_fg, pred_bbox, pred_gt_ious)
+                    pred_dams = get_dams(
+                        pool_dams, bids, rois_odam, fpn_fms, stride, level_assignments_odam, dam_size)
+
+                    assigned_gts_odam = assigned_gts[odam_masks]
+                    loss_rcnn_match = match_loss(
+                        pred_dams,
+                        assigned_gts_odam,
+                        bids,
+                        odam_pred_bbox,
+                        odam_pred_gt_ious,
+                    )
+                else:
+                    loss_rcnn_match = pred_delta_fg.sum() * 0.0
             else:
                 localization_loss = pred_delta.sum() * 0.0
                 loss_rcnn_match = pred_delta.sum() * 0.0
@@ -159,13 +195,12 @@ class RCNN(nn.Module):
             normalizer = 1.0 / valid_masks.sum().item()
             loss_rcnn_loc = localization_loss.sum() * normalizer
             loss_rcnn_cls = objectness_loss.sum() * normalizer
-            loss_rcnn_match = 0.2 * loss_rcnn_match
+            loss_rcnn_match = float(getattr(config, "odam_loss_weight", 1.0)) * loss_rcnn_match
 
             loss_dict = {}
             loss_dict['loss_rcnn_loc'] = loss_rcnn_loc
             loss_dict['loss_rcnn_cls'] = loss_rcnn_cls
-            if loss_rcnn_match > 0:
-                loss_dict['loss_rcnn_match'] = loss_rcnn_match
+            loss_dict['loss_rcnn_match'] = loss_rcnn_match
 
             return loss_dict
         else:
@@ -195,12 +230,17 @@ class RCNN(nn.Module):
             # get dam maps
             dam_size = fpn_fms[1].size()[-2:] # image_size // 8
             pred_dams = get_dams(pool_dams, bids, base_rois, fpn_fms, stride, level_assignments, dam_size)
+            keep = postprocess_predictions(pred_bbox, pred_scores[:, 0], tag[:, 0], bids, config)
+            pred_bbox = pred_bbox[keep]
+            pred_scores = pred_scores[keep]
+            tag = tag[keep]
+            pred_dams = pred_dams[keep]
 
             dam_size = pred_dams.new_tensor(dam_size).repeat(len(pred_scores),1)
             pred_bbox = torch.cat([pred_bbox, pred_scores, tag, pred_dams, dam_size], axis=1)
             return pred_bbox
 
-    def get_gradient(self, pred, pool_features):
+    def get_gradient(self, pred, pool_features, create_graph=False):
         grads = []
         with torch.enable_grad():
             for c in range(1, self.config.num_classes):
@@ -210,10 +250,49 @@ class RCNN(nn.Module):
                     pred, 
                     pool_features, 
                     grad_outputs=grad_mask, 
-                    retain_graph=True)[0]
+                    retain_graph=True,
+                    create_graph=create_graph)[0]
                 grads.append(grad)
 
         return torch.stack(grads, dim=1)  # N, C-1, 256, 7,7
+
+def smooth_pool_grads(pool_grads, kernel_size):
+    if kernel_size <= 1:
+        return pool_grads
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    sigma = max(float(kernel_size) / 3.0, 1e-6)
+    coords = torch.arange(kernel_size, dtype=pool_grads.dtype, device=pool_grads.device)
+    coords = coords - (kernel_size - 1) / 2.0
+    kernel_1d = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
+    kernel_1d = kernel_1d / kernel_1d.sum().clamp(min=1e-12)
+    kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+    channels = pool_grads.shape[2]
+    kernel = kernel_2d.reshape(1, 1, kernel_size, kernel_size).repeat(channels, 1, 1, 1)
+    flattened = pool_grads.reshape(-1, channels, pool_grads.shape[-2], pool_grads.shape[-1])
+    smoothed = F.conv2d(flattened, kernel, padding=kernel_size // 2, groups=channels)
+    return smoothed.reshape_as(pool_grads)
+
+def postprocess_predictions(boxes, scores, labels, bids, config):
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    nms_thresh = float(getattr(config, "rcnn_nms_threshold", 0.5))
+    detections_per_image = int(getattr(config, "rcnn_detections_per_image", 100))
+    keep_all = []
+    class_count = int(getattr(config, "num_classes", 1))
+    for bid in bids.unique(sorted=True):
+        image_inds = torch.nonzero(bids == bid, as_tuple=False).flatten()
+        if image_inds.numel() == 0:
+            continue
+        nms_ids = labels[image_inds].long() + bids[image_inds].long() * max(1, class_count)
+        keep = batched_nms(boxes[image_inds], scores[image_inds], nms_ids, nms_thresh)
+        if detections_per_image > 0:
+            keep = keep[:detections_per_image]
+        keep_all.append(image_inds[keep])
+    if not keep_all:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    keep = torch.cat(keep_all, dim=0)
+    return keep[scores[keep].argsort(descending=True)]
 
 def get_dams(pool_maps, bids, rois, fpn_fms, stride, level_assignments, dam_size):
     resize = transforms.Resize(dam_size)
@@ -328,40 +407,40 @@ def roi_align_inv(pool_dams, rois, scale, map_size):
     dam_maps[ids, indices[ids, valid_inds]] = roi_dam_values[ids, valid_inds] # N, map_size
     return dam_maps.reshape(N, map_size[0], map_size[1])
 
-def match_loss(dams, objs, pred_bbox, pred_gt_iou):
+def match_loss(dams, objs, bids, pred_bbox, pred_gt_iou):
     M, C = dams.shape
-    Num_gt = objs.max()+1
-    # find the best regression for each object
-    ious = pred_gt_iou.new_zeros(M, Num_gt)
-    ious[range(M), objs] = pred_gt_iou
-    max_iou, max_position = ious.max(dim=0)
-    max_position = max_position[max_iou>0]
-    max_iou = max_iou[max_iou>0]
+    if M == 0:
+        return dams.sum() * 0.0
+    objs = objs.long()
+    bids = bids.long()
 
-    pred_paired_iou = box_overlap_opr(pred_bbox, pred_bbox)
-    overlap_mask = pred_paired_iou > 0
-    pos_mask = (objs.view(M,1).expand(M,M) == \
-                objs.view(1,M).expand(M,M)).float()
-    neg_mask = overlap_mask * (1 - pos_mask) # not the same object but overlapped
-    pos_pair1, pos_pair2 = pos_mask[max_position].nonzero(as_tuple=True)
-    neg_pair1, neg_pair2 = neg_mask[max_position].nonzero(as_tuple=True)    
+    best_positions = []
+    for obj in objs.unique(sorted=True):
+        inds = torch.nonzero(objs == obj, as_tuple=False).flatten()
+        if inds.numel() == 0:
+            continue
+        best_positions.append(inds[pred_gt_iou[inds].argmax()])
+    if not best_positions:
+        return dams.sum() * 0.0
+    best_positions = torch.stack(best_positions)
+    best_objs = objs[best_positions]
+    best_bids = bids[best_positions]
+    best_dams = dams[best_positions]
 
+    same_object = best_objs[:, None] == objs[None, :]
+    same_image = best_bids[:, None] == bids[None, :]
+    different_object_same_image = same_image & ~same_object
 
-    # BCE
-    if len(max_position) > 0:
-        max_iou_dams = dams[max_position]
-        pos_sims = (max_iou_dams[pos_pair1]*dams[pos_pair2]).sum(-1).clamp(min=1e-4, max=1-1e-4) 
-        neg_sims = (max_iou_dams[neg_pair1]*dams[neg_pair2]).sum(-1).clamp(min=1e-4, max=1-1e-4) 
-        
-        pos_weights = pred_gt_iou[pos_pair2] / max_iou[pos_pair1]
-        # loss_pos = (pos_weights*(-pos_sims.log())).sum() / max(1.,pos_sims.numel())
-        loss = ((pos_weights*(-pos_sims.log())).sum()-(1-neg_sims).log().sum()) / \
-            max(1.,pos_sims.numel()+neg_sims.numel())
-    else:
-        loss = 0.
-    return loss         
+    pos_sims = (best_dams[:, None, :] * dams[None, :, :]).sum(-1)[same_object]
+    neg_sims = (best_dams[:, None, :] * dams[None, :, :]).sum(-1)[different_object_same_image]
+    pos_sims = pos_sims.clamp(min=1e-4, max=1-1e-4)
+    neg_sims = neg_sims.clamp(min=1e-4, max=1-1e-4)
 
-
+    pair_count = pos_sims.numel() + neg_sims.numel()
+    if pair_count == 0:
+        return dams.sum() * 0.0
+    loss = (-pos_sims.log().sum() - (1 - neg_sims).log().sum()) / pair_count
+    return loss
 
 
 
