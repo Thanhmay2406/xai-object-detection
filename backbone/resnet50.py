@@ -1,13 +1,13 @@
 from collections import OrderedDict
 
 from torch import nn
-from torchvision.models import resnet50
+from torchvision.models import ResNet50_Weights, resnet50
 
 
 class ResNet50(nn.Module):
-    def __init__(self, freeze_at=0, pretrained=False):
+    def __init__(self, freeze_at=0, pretrained=False, weights=None):
         super().__init__()
-        weights = None
+        weights = resolve_resnet50_weights(weights, pretrained)
         self.body = resnet50(weights=weights)
         self.stem = nn.Sequential(
             self.body.conv1,
@@ -36,3 +36,16 @@ class ResNet50(nn.Module):
         c4 = self.layer3(c3)
         c5 = self.layer4(c4)
         return OrderedDict(c2=c2, c3=c3, c4=c4, c5=c5)
+
+
+def resolve_resnet50_weights(weights, pretrained):
+    if weights is None:
+        return ResNet50_Weights.DEFAULT if pretrained else None
+    normalized = str(weights).strip().lower()
+    if normalized in {"none", "random", "scratch"}:
+        return None
+    if normalized in {"default", "coco", "imagenet", "pretrained"}:
+        return ResNet50_Weights.DEFAULT
+    raise ValueError(
+        "ResNet50 weights must be one of: none, random, scratch, default, coco, imagenet, pretrained"
+    )

@@ -3,10 +3,11 @@ import torch
 from det_oprs.bbox_opr import bbox_transform_opr, box_overlap_opr
 
 
-def fpn_roi_target(config, rpn_rois, im_info, gt_boxes, top_k=1):
-    rois = _append_gt_boxes(rpn_rois, gt_boxes)
+def fpn_roi_target(config, rpn_rois, im_info, gt_boxes, top_k=1, return_roi_is_gt=False):
+    rois, roi_is_gt = _append_gt_boxes(rpn_rois, gt_boxes)
     if rois.numel() == 0:
         rois = _fallback_rois(im_info)
+        roi_is_gt = torch.zeros((len(rois),), dtype=torch.bool, device=rois.device)
 
     labels = rois.new_zeros((len(rois),), dtype=torch.long)
     bbox_targets = rois.new_zeros((len(rois), 4))
@@ -42,10 +43,14 @@ def fpn_roi_target(config, rpn_rois, im_info, gt_boxes, top_k=1):
             bbox_targets[fg_inds] = bbox_transform_opr(rois[fg_inds, 1:5], current_gt[matched_fg, :4])
             assigned_gts[fg_inds] = matched_fg.long() + gt_offsets[batch_idx]
 
-    rois, labels, bbox_targets, assigned_gts = _sample_rois(config, rois, labels, bbox_targets, assigned_gts)
+    rois, labels, bbox_targets, assigned_gts, roi_is_gt = _sample_rois(
+        config, rois, labels, bbox_targets, assigned_gts, roi_is_gt
+    )
     means = rois.new_tensor(getattr(config, "bbox_normalize_means", [0.0, 0.0, 0.0, 0.0]))
     stds = rois.new_tensor(getattr(config, "bbox_normalize_stds", [1.0, 1.0, 1.0, 1.0]))
     bbox_targets = (bbox_targets - means) / stds
+    if return_roi_is_gt:
+        return rois, labels, bbox_targets, assigned_gts, roi_is_gt
     return rois, labels, bbox_targets, assigned_gts
 
 
@@ -67,7 +72,7 @@ def _valid_gt(gt_boxes, batch_idx, device):
 
 def _append_gt_boxes(rois, gt_boxes):
     if gt_boxes is None:
-        return rois
+        return rois, torch.zeros((len(rois),), dtype=torch.bool, device=rois.device)
     gt_rois = []
     batch_size = 1 if gt_boxes.dim() == 2 else gt_boxes.shape[0]
     for batch_idx in range(batch_size):
@@ -77,10 +82,19 @@ def _append_gt_boxes(rois, gt_boxes):
         batch_col = current_gt.new_full((len(current_gt), 1), float(batch_idx))
         gt_rois.append(torch.cat((batch_col, current_gt[:, :4]), dim=1))
     if not gt_rois:
-        return rois
+        return rois, torch.zeros((len(rois),), dtype=torch.bool, device=rois.device)
+    gt_rois = torch.cat(gt_rois, dim=0)
+    gt_is_gt = torch.ones((len(gt_rois),), dtype=torch.bool, device=gt_rois.device)
     if rois.numel() == 0:
-        return torch.cat(gt_rois, dim=0)
-    return torch.cat((rois, torch.cat(gt_rois, dim=0)), dim=0)
+        return gt_rois, gt_is_gt
+    roi_is_gt = torch.cat(
+        (
+            torch.zeros((len(rois),), dtype=torch.bool, device=rois.device),
+            gt_is_gt.to(rois.device),
+        ),
+        dim=0,
+    )
+    return torch.cat((rois, gt_rois.to(rois.device)), dim=0), roi_is_gt
 
 
 def _fallback_rois(im_info):
@@ -92,10 +106,10 @@ def _fallback_rois(im_info):
     return torch.cat(rois, dim=0)
 
 
-def _sample_rois(config, rois, labels, bbox_targets, assigned_gts):
+def _sample_rois(config, rois, labels, bbox_targets, assigned_gts, roi_is_gt):
     batch_size = int(getattr(config, "rcnn_batch_size", len(rois)))
     if batch_size <= 0 or len(rois) <= batch_size:
-        return rois, labels, bbox_targets, assigned_gts
+        return rois, labels, bbox_targets, assigned_gts, roi_is_gt
 
     fg_fraction = float(getattr(config, "rcnn_fg_fraction", 0.25))
     max_fg = int(batch_size * fg_fraction)
@@ -109,4 +123,4 @@ def _sample_rois(config, rois, labels, bbox_targets, assigned_gts):
     keep = torch.cat((fg, bg), dim=0)
     if keep.numel() == 0:
         keep = torch.arange(min(batch_size, len(rois)), device=rois.device)
-    return rois[keep], labels[keep], bbox_targets[keep], assigned_gts[keep]
+    return rois[keep], labels[keep], bbox_targets[keep], assigned_gts[keep], roi_is_gt[keep]
