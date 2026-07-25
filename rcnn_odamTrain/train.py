@@ -60,7 +60,15 @@ class TrainConfig:
 
 
 class CocoDrillBitDataset(Dataset):
-    def __init__(self, root, split, mapping=None, image_size=None, keep_empty=True):
+    def __init__(
+        self,
+        root,
+        split,
+        mapping=None,
+        image_size=None,
+        keep_empty=True,
+        include_empty_categories=False,
+    ):
         self.root = Path(root)
         self.split = split
         self.split_dir = self.root / split
@@ -72,7 +80,11 @@ class CocoDrillBitDataset(Dataset):
             self.coco = json.load(handle)
 
         used_category_ids = {int(ann["category_id"]) for ann in self.coco.get("annotations", [])}
-        self.mapping = mapping or build_category_mapping(self.coco["categories"], used_category_ids)
+        mapping_used_ids = None if include_empty_categories else used_category_ids
+        self.mapping = mapping or build_category_mapping(
+            self.coco["categories"],
+            mapping_used_ids,
+        )
         self.image_size = image_size
         annotations_by_image = {}
         for ann in self.coco.get("annotations", []):
@@ -657,6 +669,15 @@ def parse_args():
     parser.add_argument("--resume", default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--keep-empty", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--include-empty-categories",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include COCO categories with zero annotations in the label space. "
+            "Use this to match baseline/train_faster_rcnn.py outputs."
+        ),
+    )
     parser.add_argument("--max-train-images", type=int, default=None)
     parser.add_argument("--max-val-images", type=int, default=None)
     parser.add_argument("--max-test-images", type=int, default=None)
@@ -665,8 +686,15 @@ def parse_args():
     parser.add_argument("--log-first-n", type=int, default=3)
     parser.add_argument("--test-after-train", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--test-split", default="test")
-    parser.add_argument("--test-checkpoint", choices=("last",), default="last")
+    parser.add_argument("--test-checkpoint", choices=("best", "last"), default="best")
     parser.add_argument("--score-threshold", type=float, default=0.001)
+    parser.add_argument(
+        "--eval-coco-every",
+        type=int,
+        default=1,
+        help="Run COCO validation every N epochs. Use 0 to disable.",
+    )
+    parser.add_argument("--max-val-coco-images", type=int, default=None)
     parser.add_argument("--backbone-freeze-at", type=int, default=0)
     parser.add_argument("--pred-cls-threshold", type=float, default=0.05)
     parser.add_argument("--rpn-pre-nms-topk", type=int, default=1000)
@@ -686,6 +714,10 @@ def main():
         raise ValueError("--workers must be >= 0")
     if args.max_test_images is not None and args.max_test_images < 1:
         raise ValueError("--max-test-images must be >= 1")
+    if args.max_val_coco_images is not None and args.max_val_coco_images < 1:
+        raise ValueError("--max-val-coco-images must be >= 1")
+    if args.eval_coco_every < 0:
+        raise ValueError("--eval-coco-every must be >= 0")
     distributed = setup_distributed(should_enable_distributed(args.distributed))
     seed_everything(args.seed)
     try:
@@ -693,7 +725,7 @@ def main():
         if distributed.is_main:
             output_dir.mkdir(parents=True, exist_ok=True)
             if args.overwrite and args.resume is None:
-                for name in ("metrics.csv", "last.pt", "config.json", "test_metrics.json"):
+                for name in ("metrics.csv", "last.pt", "best.pt", "config.json", "test_metrics.json"):
                     path = output_dir / name
                     if path.exists():
                         path.unlink()
@@ -704,6 +736,7 @@ def main():
             "train",
             image_size=args.image_size,
             keep_empty=args.keep_empty,
+            include_empty_categories=args.include_empty_categories,
         )
         mapping = train_dataset_full.mapping
         val_dataset_full = CocoDrillBitDataset(
@@ -715,6 +748,10 @@ def main():
         )
         train_dataset = maybe_subset(train_dataset_full, args.max_train_images)
         val_dataset = maybe_subset(val_dataset_full, args.max_val_images)
+        val_coco_dataset = maybe_subset(
+            val_dataset_full,
+            args.max_val_coco_images or args.max_val_images,
+        )
 
         config = make_config(args, mapping)
 
@@ -782,6 +819,13 @@ def main():
             shuffle=False,
             pin_memory=device.type == "cuda",
         )
+        val_coco_loader = build_loader(
+            val_coco_dataset,
+            batch_size=1,
+            workers=args.workers,
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+        )
 
         run_config = {
             "mapping": asdict(mapping),
@@ -789,6 +833,7 @@ def main():
             "args": vars(args),
             "train_images": len(train_dataset),
             "valid_images": len(val_dataset),
+            "valid_coco_images": len(val_coco_dataset),
             "device": str(device),
             "distributed": asdict(distributed),
             "batch_size_per_rank": args.batch_size,
@@ -801,12 +846,14 @@ def main():
             )
             print(
                 f"dataset train={len(train_dataset)} valid={len(val_dataset)} "
+                f"valid_coco={len(val_coco_dataset)} "
                 f"classes={mapping.train_to_name} device={device} "
                 f"distributed={distributed.enabled} world_size={distributed.world_size} "
                 f"batch_size_per_rank={args.batch_size}",
                 flush=True,
             )
 
+        best_map50 = -math.inf
         for epoch in range(start_epoch, args.epochs + 1):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -829,6 +876,26 @@ def main():
             val_metrics = {}
             if distributed.is_main:
                 val_metrics = validate_loss(raw_model, val_loader, device, args, phase="valid")
+                if args.eval_coco_every and (
+                    epoch % args.eval_coco_every == 0
+                    or epoch == args.epochs
+                ):
+                    val_coco_metrics = evaluate_coco(
+                        raw_model,
+                        val_coco_loader,
+                        device,
+                        mapping,
+                        "valid",
+                        args.score_threshold,
+                        args.log_every,
+                        args.log_first_n,
+                    )
+                    val_metrics.update(
+                        {
+                            f"val_{key}": value
+                            for key, value in val_coco_metrics.items()
+                        }
+                    )
 
             scheduler.step()
             row = {
@@ -851,20 +918,36 @@ def main():
                     config,
                     args,
                 )
+                current_map50 = float(row.get("val_map50", -math.inf))
+                is_best = current_map50 > best_map50
+                if is_best:
+                    best_map50 = current_map50
+                    save_checkpoint(
+                        output_dir / "best.pt",
+                        raw_model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        epoch,
+                        mapping,
+                        config,
+                        args,
+                    )
+                summary_text = " ".join(
+                    f"{key}={value:.4f}"
+                    for key, value in sorted(row.items())
+                    if isinstance(value, float)
+                )
                 print(
-                    "epoch_summary "
-                    + " ".join(
-                        f"{key}={value:.4f}"
-                        for key, value in sorted(row.items())
-                        if isinstance(value, float)
-                    ),
+                    f"epoch_summary {summary_text} "
+                    f"best_map50={best_map50:.4f}",
                     flush=True,
                 )
             distributed_barrier(distributed)
 
         distributed_barrier(distributed)
         if args.test_after_train and distributed.is_main:
-            checkpoint_path = output_dir / "last.pt"
+            checkpoint_path = output_dir / f"{args.test_checkpoint}.pt"
             checkpoint_epoch = load_model_checkpoint_for_eval(checkpoint_path, raw_model, device)
             test_dataset_full = CocoDrillBitDataset(
                 args.data_root,
@@ -894,7 +977,7 @@ def main():
             )
             payload = {
                 "split": args.test_split,
-                "checkpoint": "last",
+                "checkpoint": args.test_checkpoint,
                 "checkpoint_path": str(checkpoint_path),
                 "checkpoint_epoch": checkpoint_epoch,
                 "images": len(test_dataset),
