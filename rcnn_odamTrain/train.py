@@ -52,6 +52,8 @@ class TrainConfig:
     rpn_post_nms_topk: int
     rpn_nms_threshold: float
     rpn_min_size: float
+    rpn_batch_size: int
+    rpn_fg_fraction: float
     rcnn_batch_size: int
     rcnn_fg_fraction: float
     rcnn_fg_threshold: float
@@ -209,6 +211,8 @@ def make_config(args, mapping):
         rpn_post_nms_topk=args.rpn_post_nms_topk,
         rpn_nms_threshold=0.7,
         rpn_min_size=1.0,
+        rpn_batch_size=args.rpn_batch_size,
+        rpn_fg_fraction=args.rpn_fg_fraction,
         rcnn_batch_size=args.rcnn_batch_size,
         rcnn_fg_fraction=0.25,
         rcnn_fg_threshold=0.5,
@@ -570,6 +574,13 @@ def create_empty_coco_results(coco_gt):
     return coco_dt
 
 
+def sanitize_metric_name(name):
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(name))
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_") or "class"
+
+
 def evaluate_coco(model, loader, device, mapping, split, score_threshold, log_every, log_first_n):
     try:
         from pycocotools.coco import COCO
@@ -583,20 +594,25 @@ def evaluate_coco(model, loader, device, mapping, split, score_threshold, log_ev
     coco_gt = COCO(str(base_dataset.annotation_path))
     predictions = []
     total_predictions = 0
+    total_gt = 0
     start = time.perf_counter()
     total_steps = len(loader)
 
     print(f"phase={split} coco_eval start batches={total_steps} score_threshold={score_threshold}", flush=True)
     for step, batch in enumerate(loader, start=1):
         step_start = time.perf_counter()
-        images, im_info, _, image_id_tensor = move_batch(batch, device)
+        images, im_info, gt_boxes, image_id_tensor = move_batch(batch, device)
         if images.shape[0] != 1:
             raise ValueError("COCO eval for rcnn_odamTrain requires batch_size=1")
         image_id = int(image_id_tensor.item())
+        total_gt += int((gt_boxes[..., 4] >= 0).sum().item())
 
         # Network test forward computes ODAM gradients internally.
         outputs = model(images, im_info).detach().cpu()
         scale_x, scale_y = base_dataset.resize_scale(image_id)
+        image_info = base_dataset.image_by_id[image_id]
+        image_width = float(image_info["width"])
+        image_height = float(image_info["height"])
         kept = 0
         if outputs.numel() > 0:
             for output in outputs:
@@ -606,10 +622,10 @@ def evaluate_coco(model, loader, device, mapping, split, score_threshold, log_ev
                 train_label = int(output[5].item())
                 if train_label not in mapping.train_to_coco:
                     continue
-                x1 = float(output[0].item()) / scale_x
-                y1 = float(output[1].item()) / scale_y
-                x2 = float(output[2].item()) / scale_x
-                y2 = float(output[3].item()) / scale_y
+                x1 = max(0.0, min(image_width - 1.0, float(output[0].item()) / scale_x))
+                y1 = max(0.0, min(image_height - 1.0, float(output[1].item()) / scale_y))
+                x2 = max(0.0, min(image_width - 1.0, float(output[2].item()) / scale_x))
+                y2 = max(0.0, min(image_height - 1.0, float(output[3].item()) / scale_y))
                 width = max(0.0, x2 - x1)
                 height = max(0.0, y2 - y1)
                 if width <= 0.0 or height <= 0.0:
@@ -657,12 +673,33 @@ def evaluate_coco(model, loader, device, mapping, split, score_threshold, log_ev
         "ar_small": float(stats[9]),
         "ar_medium": float(stats[10]),
         "ar_large": float(stats[11]),
+        "gt_total": float(total_gt),
         "pred_total": float(total_predictions),
     }
+    precision = coco_eval.eval.get("precision")
+    if precision is not None:
+        iou_thresholds = coco_eval.params.iouThrs
+        iou50_index = int(np.argmin(np.abs(iou_thresholds - 0.5)))
+        area_all_index = 0
+        max_dets_100_index = len(coco_eval.params.maxDets) - 1
+        for category_index, coco_category_id in enumerate(coco_eval.params.catIds):
+            values = precision[
+                iou50_index,
+                :,
+                category_index,
+                area_all_index,
+                max_dets_100_index,
+            ]
+            valid_values = values[values > -1]
+            class_ap50 = float(np.mean(valid_values)) if valid_values.size else 0.0
+            train_label = mapping.coco_to_train[coco_category_id]
+            class_name = mapping.train_to_name[train_label]
+            metrics[f"class_{train_label}_{sanitize_metric_name(class_name)}_ap50"] = class_ap50
     print(
         f"phase={split} coco_eval done map_50_95={metrics['map_50_95']:.4f} "
         f"map50={metrics['map50']:.4f} map75={metrics['map75']:.4f} "
-        f"pred_total={int(metrics['pred_total'])} elapsed={format_seconds(time.perf_counter() - start)}",
+        f"gt_total={int(metrics['gt_total'])} pred_total={int(metrics['pred_total'])} "
+        f"elapsed={format_seconds(time.perf_counter() - start)}",
         flush=True,
     )
     return metrics
@@ -752,6 +789,18 @@ def parse_args():
     )
     parser.add_argument("--rpn-pre-nms-topk", type=int, default=1000)
     parser.add_argument("--rpn-post-nms-topk", type=int, default=300)
+    parser.add_argument(
+        "--rpn-batch-size",
+        type=int,
+        default=256,
+        help="Number of anchors sampled per image for RPN loss. Use <=0 to keep all valid anchors.",
+    )
+    parser.add_argument(
+        "--rpn-fg-fraction",
+        type=float,
+        default=0.5,
+        help="Maximum fraction of positive anchors in the sampled RPN loss batch.",
+    )
     parser.add_argument("--rcnn-batch-size", type=int, default=128)
     parser.add_argument("--rpn-anchor-sizes", type=int, nargs="+", default=[256, 128, 64, 32, 16])
     return parser.parse_args()
@@ -775,6 +824,8 @@ def main():
         raise ValueError("--rcnn-nms-threshold must be in [0, 1]")
     if args.rcnn_detections_per_image < 1:
         raise ValueError("--rcnn-detections-per-image must be >= 1")
+    if args.rpn_fg_fraction < 0.0 or args.rpn_fg_fraction > 1.0:
+        raise ValueError("--rpn-fg-fraction must be in [0, 1]")
     if args.odam_loss_weight < 0.0:
         raise ValueError("--odam-loss-weight must be >= 0")
     if args.odam_smooth_kernel < 1:

@@ -95,14 +95,24 @@ class RPN(nn.Module):
 
     def _losses(self, anchors, logits, deltas, gt_boxes, im_info):
         labels, targets = _assign_targets(anchors, gt_boxes, im_info)
-        valid = labels >= 0
-        positive = labels == 1
+        sampled = _sample_balanced_anchors(labels, self.config)
+        valid = sampled & (labels >= 0)
+        positive = sampled & (labels == 1)
         if valid.any():
-            cls_loss = F.binary_cross_entropy_with_logits(logits[valid], labels[valid].float())
+            cls_loss = F.binary_cross_entropy_with_logits(
+                logits[valid],
+                labels[valid].float(),
+                reduction="mean",
+            )
         else:
             cls_loss = logits.sum() * 0.0
         if positive.any():
-            loc_loss = F.smooth_l1_loss(deltas[positive], targets[positive], beta=1.0, reduction="mean")
+            loc_loss = F.smooth_l1_loss(
+                deltas[positive],
+                targets[positive],
+                beta=1.0,
+                reduction="sum",
+            ) / valid.sum().clamp(min=1)
         else:
             loc_loss = deltas.sum() * 0.0
         return {"loss_rpn_cls": cls_loss, "loss_rpn_loc": loc_loss}
@@ -147,15 +157,59 @@ def _assign_targets(anchors, gt_boxes, im_info):
     labels = anchors.new_full((batch_size, anchors.shape[0]), -1, dtype=torch.long)
     targets = anchors.new_zeros((batch_size, anchors.shape[0], 4))
     for batch_idx in range(batch_size):
+        inside = _inside_image(anchors, im_info[batch_idx])
+        if not inside.any():
+            continue
         current_gt = _iter_gt(gt_boxes, batch_idx, anchors.device)
         if current_gt.numel() == 0:
-            labels[batch_idx].fill_(0)
+            labels[batch_idx][inside] = 0
             continue
-        overlaps = box_overlap_opr(anchors, current_gt[:, :4])
+        anchor_inds = torch.nonzero(inside, as_tuple=False).flatten()
+        inside_anchors = anchors[anchor_inds]
+        overlaps = box_overlap_opr(inside_anchors, current_gt[:, :4])
         max_iou, matched = overlaps.max(dim=1)
-        labels[batch_idx][max_iou < 0.3] = 0
-        labels[batch_idx][max_iou >= 0.7] = 1
+        labels[batch_idx][anchor_inds[max_iou < 0.3]] = 0
+        labels[batch_idx][anchor_inds[max_iou >= 0.7]] = 1
         gt_best = overlaps.argmax(dim=0)
-        labels[batch_idx][gt_best] = 1
-        targets[batch_idx] = bbox_transform_opr(anchors, current_gt[matched, :4])
+        labels[batch_idx][anchor_inds[gt_best]] = 1
+        targets[batch_idx][anchor_inds] = bbox_transform_opr(
+            inside_anchors,
+            current_gt[matched, :4],
+        )
     return labels, targets
+
+
+def _inside_image(anchors, info):
+    height = float(info[0])
+    width = float(info[1])
+    return (
+        (anchors[:, 0] >= 0)
+        & (anchors[:, 1] >= 0)
+        & (anchors[:, 2] <= width - 1)
+        & (anchors[:, 3] <= height - 1)
+    )
+
+
+def _sample_balanced_anchors(labels, config):
+    batch_size = int(getattr(config, "rpn_batch_size", 256))
+    positive_fraction = float(getattr(config, "rpn_fg_fraction", 0.5))
+    if batch_size <= 0:
+        return labels >= 0
+
+    positive_fraction = max(0.0, min(1.0, positive_fraction))
+    sampled = torch.zeros_like(labels, dtype=torch.bool)
+    max_pos = int(batch_size * positive_fraction)
+    for batch_idx in range(labels.shape[0]):
+        positive = torch.nonzero(labels[batch_idx] == 1, as_tuple=False).flatten()
+        negative = torch.nonzero(labels[batch_idx] == 0, as_tuple=False).flatten()
+
+        num_pos = min(int(positive.numel()), max_pos)
+        num_neg = min(int(negative.numel()), batch_size - num_pos)
+
+        if num_pos > 0:
+            perm = torch.randperm(positive.numel(), device=labels.device)[:num_pos]
+            sampled[batch_idx, positive[perm]] = True
+        if num_neg > 0:
+            perm = torch.randperm(negative.numel(), device=labels.device)[:num_neg]
+            sampled[batch_idx, negative[perm]] = True
+    return sampled

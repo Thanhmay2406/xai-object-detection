@@ -17,6 +17,8 @@ loss. The implementation keeps standard detector losses, computes ODAM maps
 from positive predicted proposals, excludes GT-appended ROIs from the ODAM
 auxiliary loss by default, filters ODAM pairs by image id, and applies RCNN
 post-processing before COCO evaluation.
+RPN training samples a balanced mini-batch of anchors per image by default,
+instead of letting the many negative anchors dominate the objectness loss.
 
 ### Install
 
@@ -66,6 +68,9 @@ Single-GPU/local command:
   --image-size 640 \
   --device cuda:0 \
   --amp \
+  --include-empty-categories \
+  --rpn-batch-size 256 \
+  --rpn-fg-fraction 0.5 \
   --test-after-train \
   --test-checkpoint best
 ```
@@ -83,6 +88,9 @@ torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
   --workers 2 \
   --image-size 640 \
   --amp \
+  --include-empty-categories \
+  --rpn-batch-size 256 \
+  --rpn-fg-fraction 0.5 \
   --test-after-train \
   --test-checkpoint best
 ```
@@ -91,6 +99,8 @@ torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
 weights. Use `--backbone-weights none` when running fully offline without a
 pretrained-weight cache, and run the baseline from scratch as well if you need a
 fair scratch-vs-scratch comparison.
+`--include-empty-categories` keeps the saved ODAM label mapping aligned with the
+baseline when the COCO file contains categories with no annotations.
 
 ### Fair Baseline Command
 
