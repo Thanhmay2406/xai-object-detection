@@ -175,7 +175,7 @@ def _assign_targets(anchors, gt_boxes, im_info):
         targets[batch_idx][anchor_inds] = bbox_transform_opr(
             inside_anchors,
             current_gt[matched, :4],
-        )
+        ).to(dtype=targets.dtype, device=targets.device)
     return labels, targets
 
 
