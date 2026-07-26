@@ -19,6 +19,8 @@ auxiliary loss by default, filters ODAM pairs by image id, and applies RCNN
 post-processing before COCO evaluation.
 RPN training samples a balanced mini-batch of anchors per image by default,
 instead of letting the many negative anchors dominate the objectness loss.
+ODAM-NMS can be enabled at evaluation/inference time to use both bounding-box
+IoU and ODAM heatmap correlation when removing duplicate detections.
 
 ### Install
 
@@ -71,6 +73,10 @@ Single-GPU/local command:
   --include-empty-categories \
   --rpn-batch-size 256 \
   --rpn-fg-fraction 0.5 \
+  --odam-nms \
+  --odam-nms-low-threshold 0.2 \
+  --odam-nms-high-threshold 0.8 \
+  --odam-nms-resize-short-edge 50 \
   --test-after-train \
   --test-checkpoint best
 ```
@@ -91,6 +97,10 @@ torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
   --include-empty-categories \
   --rpn-batch-size 256 \
   --rpn-fg-fraction 0.5 \
+  --odam-nms \
+  --odam-nms-low-threshold 0.2 \
+  --odam-nms-high-threshold 0.8 \
+  --odam-nms-resize-short-edge 50 \
   --test-after-train \
   --test-checkpoint best
 ```
@@ -101,6 +111,11 @@ pretrained-weight cache, and run the baseline from scratch as well if you need a
 fair scratch-vs-scratch comparison.
 `--include-empty-categories` keeps the saved ODAM label mapping aligned with the
 baseline when the COCO file contains categories with no annotations.
+`--odam-nms-low-threshold 0.2` and `--odam-nms-high-threshold 0.8` follow the
+paper's default ODAM-Train setting; disable with `--no-odam-nms` for classical
+IoU-only NMS ablations.
+`--odam-nms-resize-short-edge 50` matches the paper's heatmap-correlation
+preprocessing.
 
 ### Fair Baseline Command
 

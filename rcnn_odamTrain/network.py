@@ -230,7 +230,15 @@ class RCNN(nn.Module):
             # get dam maps
             dam_size = fpn_fms[1].size()[-2:] # image_size // 8
             pred_dams = get_dams(pool_dams, bids, base_rois, fpn_fms, stride, level_assignments, dam_size)
-            keep = postprocess_predictions(pred_bbox, pred_scores[:, 0], tag[:, 0], bids, config)
+            keep = postprocess_predictions(
+                pred_bbox,
+                pred_scores[:, 0],
+                tag[:, 0],
+                bids,
+                config,
+                pred_dams,
+                dam_size,
+            )
             pred_bbox = pred_bbox[keep]
             pred_scores = pred_scores[keep]
             tag = tag[keep]
@@ -273,19 +281,33 @@ def smooth_pool_grads(pool_grads, kernel_size):
     smoothed = F.conv2d(flattened, kernel, padding=kernel_size // 2, groups=channels)
     return smoothed.reshape_as(pool_grads)
 
-def postprocess_predictions(boxes, scores, labels, bids, config):
+def postprocess_predictions(boxes, scores, labels, bids, config, dams=None, dam_size=None):
     if boxes.numel() == 0:
         return torch.zeros((0,), dtype=torch.long, device=boxes.device)
     nms_thresh = float(getattr(config, "rcnn_nms_threshold", 0.5))
     detections_per_image = int(getattr(config, "rcnn_detections_per_image", 100))
+    use_odam_nms = bool(getattr(config, "odam_nms", False)) and dams is not None
     keep_all = []
     class_count = int(getattr(config, "num_classes", 1))
     for bid in bids.unique(sorted=True):
         image_inds = torch.nonzero(bids == bid, as_tuple=False).flatten()
         if image_inds.numel() == 0:
             continue
-        nms_ids = labels[image_inds].long() + bids[image_inds].long() * max(1, class_count)
-        keep = batched_nms(boxes[image_inds], scores[image_inds], nms_ids, nms_thresh)
+        if use_odam_nms:
+            keep = odam_nms_image(
+                boxes[image_inds],
+                scores[image_inds],
+                labels[image_inds],
+                dams[image_inds],
+                nms_thresh,
+                float(getattr(config, "odam_nms_low_threshold", 0.2)),
+                float(getattr(config, "odam_nms_high_threshold", 0.8)),
+                int(getattr(config, "odam_nms_resize_short_edge", 50)),
+                dam_size,
+            )
+        else:
+            nms_ids = labels[image_inds].long() + bids[image_inds].long() * max(1, class_count)
+            keep = batched_nms(boxes[image_inds], scores[image_inds], nms_ids, nms_thresh)
         if detections_per_image > 0:
             keep = keep[:detections_per_image]
         keep_all.append(image_inds[keep])
@@ -293,6 +315,102 @@ def postprocess_predictions(boxes, scores, labels, bids, config):
         return torch.zeros((0,), dtype=torch.long, device=boxes.device)
     keep = torch.cat(keep_all, dim=0)
     return keep[scores[keep].argsort(descending=True)]
+
+
+def odam_nms_image(
+    boxes,
+    scores,
+    labels,
+    dams,
+    iou_threshold,
+    corr_low_threshold,
+    corr_high_threshold,
+    resize_short_edge,
+    dam_size,
+):
+    keep_all = []
+    for label in labels.unique(sorted=True):
+        class_inds = torch.nonzero(labels == label, as_tuple=False).flatten()
+        if class_inds.numel() == 0:
+            continue
+        keep_class = odam_nms_class(
+            boxes[class_inds],
+            scores[class_inds],
+            dams[class_inds],
+            iou_threshold,
+            corr_low_threshold,
+            corr_high_threshold,
+            resize_short_edge,
+            dam_size,
+        )
+        keep_all.append(class_inds[keep_class])
+    if not keep_all:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    keep = torch.cat(keep_all, dim=0)
+    return keep[scores[keep].argsort(descending=True)]
+
+
+def odam_nms_class(
+    boxes,
+    scores,
+    dams,
+    iou_threshold,
+    corr_low_threshold,
+    corr_high_threshold,
+    resize_short_edge=50,
+    dam_size=None,
+):
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    order = scores.argsort(descending=True)
+    selected = []
+    dam_vectors = prepare_odam_nms_heatmaps(dams, dam_size, resize_short_edge)
+    iou_threshold = float(iou_threshold)
+    corr_low_threshold = float(corr_low_threshold)
+    corr_high_threshold = float(corr_high_threshold)
+
+    while order.numel() > 0:
+        current = order[0]
+        is_duplicate = False
+        if selected:
+            selected_tensor = torch.stack(selected).to(device=boxes.device)
+            ious = box_overlap_opr(boxes[current].reshape(1, 4), boxes[selected_tensor]).flatten()
+            corr = (dam_vectors[current].reshape(1, -1) @ dam_vectors[selected_tensor].T).flatten()
+            duplicate_by_high_iou = (ious >= iou_threshold) & (corr > corr_low_threshold)
+            duplicate_by_high_corr = (ious < iou_threshold) & (corr > corr_high_threshold)
+            is_duplicate = bool((duplicate_by_high_iou | duplicate_by_high_corr).any().item())
+        if not is_duplicate:
+            selected.append(current)
+        order = order[1:]
+
+    if not selected:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    keep = torch.stack(selected)
+    return keep[scores[keep].argsort(descending=True)]
+
+
+def prepare_odam_nms_heatmaps(dams, dam_size=None, resize_short_edge=50):
+    vectors = dams.float()
+    if dam_size is not None and int(resize_short_edge) > 0:
+        if isinstance(dam_size, torch.Tensor):
+            height = int(dam_size[0].item())
+            width = int(dam_size[1].item())
+        else:
+            height = int(dam_size[0])
+            width = int(dam_size[1])
+        if height > 0 and width > 0 and height * width == vectors.shape[1]:
+            short_edge = min(height, width)
+            if short_edge > 0 and short_edge != int(resize_short_edge):
+                scale = float(resize_short_edge) / float(short_edge)
+                new_height = max(1, int(round(height * scale)))
+                new_width = max(1, int(round(width * scale)))
+                vectors = F.interpolate(
+                    vectors.reshape(-1, 1, height, width),
+                    size=(new_height, new_width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).reshape(vectors.shape[0], -1)
+    return F.normalize(vectors, p=2, dim=1, eps=1e-12)
 
 def get_dams(pool_maps, bids, rois, fpn_fms, stride, level_assignments, dam_size):
     resize = transforms.Resize(dam_size)
@@ -441,8 +559,6 @@ def match_loss(dams, objs, bids, pred_bbox, pred_gt_iou):
         return dams.sum() * 0.0
     loss = (-pos_sims.log().sum() - (1 - neg_sims).log().sum()) / pair_count
     return loss
-
-
 
 
 

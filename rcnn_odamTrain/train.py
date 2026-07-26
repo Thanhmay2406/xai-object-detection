@@ -62,6 +62,10 @@ class TrainConfig:
     rpn_anchor_ratios: list[float]
     rcnn_nms_threshold: float = 0.5
     rcnn_detections_per_image: int = 100
+    odam_nms: bool = False
+    odam_nms_low_threshold: float = 0.2
+    odam_nms_high_threshold: float = 0.8
+    odam_nms_resize_short_edge: int = 50
     odam_loss_weight: float = 1.0
     odam_smooth_kernel: int = 3
     odam_create_graph: bool = True
@@ -221,6 +225,10 @@ def make_config(args, mapping):
         rpn_anchor_ratios=[0.5, 1.0, 2.0],
         rcnn_nms_threshold=args.rcnn_nms_threshold,
         rcnn_detections_per_image=args.rcnn_detections_per_image,
+        odam_nms=args.odam_nms,
+        odam_nms_low_threshold=args.odam_nms_low_threshold,
+        odam_nms_high_threshold=args.odam_nms_high_threshold,
+        odam_nms_resize_short_edge=args.odam_nms_resize_short_edge,
         odam_loss_weight=args.odam_loss_weight,
         odam_smooth_kernel=args.odam_smooth_kernel,
         odam_create_graph=args.odam_create_graph,
@@ -767,6 +775,30 @@ def parse_args():
     parser.add_argument("--pred-cls-threshold", type=float, default=0.05)
     parser.add_argument("--rcnn-nms-threshold", type=float, default=0.5)
     parser.add_argument("--rcnn-detections-per-image", type=int, default=100)
+    parser.add_argument(
+        "--odam-nms",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use ODAM-NMS in RCNN post-processing instead of classical IoU-only NMS.",
+    )
+    parser.add_argument(
+        "--odam-nms-low-threshold",
+        type=float,
+        default=0.2,
+        help="Low heatmap-correlation threshold T_l for high-IoU pairs in ODAM-NMS.",
+    )
+    parser.add_argument(
+        "--odam-nms-high-threshold",
+        type=float,
+        default=0.8,
+        help="High heatmap-correlation threshold T_h for low-IoU pairs in ODAM-NMS.",
+    )
+    parser.add_argument(
+        "--odam-nms-resize-short-edge",
+        type=int,
+        default=50,
+        help="Resize ODAM heatmaps to this short-edge length before ODAM-NMS correlation. Use <=0 to disable.",
+    )
     parser.add_argument("--odam-loss-weight", type=float, default=1.0)
     parser.add_argument("--odam-smooth-kernel", type=int, default=3)
     parser.add_argument(
@@ -824,6 +856,14 @@ def main():
         raise ValueError("--rcnn-nms-threshold must be in [0, 1]")
     if args.rcnn_detections_per_image < 1:
         raise ValueError("--rcnn-detections-per-image must be >= 1")
+    if not 0.0 <= args.odam_nms_low_threshold <= 1.0:
+        raise ValueError("--odam-nms-low-threshold must be in [0, 1]")
+    if not 0.0 <= args.odam_nms_high_threshold <= 1.0:
+        raise ValueError("--odam-nms-high-threshold must be in [0, 1]")
+    if args.odam_nms_low_threshold > args.odam_nms_high_threshold:
+        raise ValueError("--odam-nms-low-threshold must be <= --odam-nms-high-threshold")
+    if args.odam_nms_resize_short_edge < 0:
+        raise ValueError("--odam-nms-resize-short-edge must be >= 0")
     if args.rpn_fg_fraction < 0.0 or args.rpn_fg_fraction > 1.0:
         raise ValueError("--rpn-fg-fraction must be in [0, 1]")
     if args.odam_loss_weight < 0.0:
