@@ -67,6 +67,9 @@ class TrainConfig:
     odam_nms_high_threshold: float = 0.8
     odam_nms_resize_short_edge: int = 50
     odam_loss_weight: float = 1.0
+    odam_loss_weight_effective: float | None = None
+    odam_loss_start_epoch: int = 1
+    odam_loss_warmup_epochs: int = 0
     odam_smooth_kernel: int = 3
     odam_create_graph: bool = True
     odam_use_confidence_target: bool = True
@@ -230,6 +233,9 @@ def make_config(args, mapping):
         odam_nms_high_threshold=args.odam_nms_high_threshold,
         odam_nms_resize_short_edge=args.odam_nms_resize_short_edge,
         odam_loss_weight=args.odam_loss_weight,
+        odam_loss_weight_effective=None,
+        odam_loss_start_epoch=args.odam_loss_start_epoch,
+        odam_loss_warmup_epochs=args.odam_loss_warmup_epochs,
         odam_smooth_kernel=args.odam_smooth_kernel,
         odam_create_graph=args.odam_create_graph,
         odam_use_confidence_target=args.odam_use_confidence_target,
@@ -364,6 +370,25 @@ def should_log_step(step, total_steps, args):
     )
 
 
+def compute_odam_loss_weight(epoch, args):
+    target_weight = float(args.odam_loss_weight)
+    if target_weight <= 0.0:
+        return 0.0
+    if epoch < int(args.odam_loss_start_epoch):
+        return 0.0
+    warmup_epochs = int(args.odam_loss_warmup_epochs)
+    if warmup_epochs <= 0:
+        return target_weight
+    warmup_step = epoch - int(args.odam_loss_start_epoch) + 1
+    progress = min(1.0, max(0.0, warmup_step / float(warmup_epochs)))
+    return target_weight * progress
+
+
+def set_odam_loss_weight(model, weight):
+    module = model.module if hasattr(model, "module") else model
+    module.config.odam_loss_weight_effective = float(weight)
+
+
 def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, rank=0):
     model.train()
     totals = {}
@@ -373,9 +398,11 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, rank=
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     if rank == 0:
+        model_config = (model.module if hasattr(model, "module") else model).config
         print(
             f"epoch={epoch} phase=train start batches={total_steps} "
-            f"batch_size={loader.batch_size} amp={args.amp and device.type == 'cuda'}",
+            f"batch_size={loader.batch_size} amp={args.amp and device.type == 'cuda'} "
+            f"odam_loss_weight_effective={getattr(model_config, 'odam_loss_weight_effective', None)}",
             flush=True,
         )
     for step, batch in enumerate(loader, start=1):
@@ -800,6 +827,24 @@ def parse_args():
         help="Resize ODAM heatmaps to this short-edge length before ODAM-NMS correlation. Use <=0 to disable.",
     )
     parser.add_argument("--odam-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--odam-loss-start-epoch",
+        type=int,
+        default=1,
+        help=(
+            "Epoch where ODAM auxiliary loss becomes active. "
+            "Earlier epochs use an effective ODAM loss weight of 0."
+        ),
+    )
+    parser.add_argument(
+        "--odam-loss-warmup-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Linearly ramp ODAM loss from 0 to --odam-loss-weight over this many "
+            "active epochs. Use 0 to keep a constant weight after start epoch."
+        ),
+    )
     parser.add_argument("--odam-smooth-kernel", type=int, default=3)
     parser.add_argument(
         "--odam-create-graph",
@@ -868,6 +913,10 @@ def main():
         raise ValueError("--rpn-fg-fraction must be in [0, 1]")
     if args.odam_loss_weight < 0.0:
         raise ValueError("--odam-loss-weight must be >= 0")
+    if args.odam_loss_start_epoch < 1:
+        raise ValueError("--odam-loss-start-epoch must be >= 1")
+    if args.odam_loss_warmup_epochs < 0:
+        raise ValueError("--odam-loss-warmup-epochs must be >= 0")
     if args.odam_smooth_kernel < 1:
         raise ValueError("--odam-smooth-kernel must be >= 1")
     distributed = setup_distributed(should_enable_distributed(args.distributed))
@@ -979,6 +1028,8 @@ def main():
             pin_memory=device.type == "cuda",
         )
 
+        initial_odam_loss_weight = compute_odam_loss_weight(start_epoch, args)
+        set_odam_loss_weight(raw_model, initial_odam_loss_weight)
         run_config = {
             "mapping": asdict(mapping),
             "config": asdict(config),
@@ -1010,8 +1061,14 @@ def main():
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             lr_used = optimizer.param_groups[0]["lr"]
+            odam_loss_weight_effective = compute_odam_loss_weight(epoch, args)
+            set_odam_loss_weight(raw_model, odam_loss_weight_effective)
             if distributed.is_main:
-                print(f"epoch={epoch} start lr={lr_used:.6g}", flush=True)
+                print(
+                    f"epoch={epoch} start lr={lr_used:.6g} "
+                    f"odam_loss_weight_effective={odam_loss_weight_effective:.6g}",
+                    flush=True,
+                )
 
             train_metrics = train_one_epoch(
                 train_model,
@@ -1054,6 +1111,7 @@ def main():
                 "epoch": epoch,
                 "lr": lr_used,
                 "next_lr": optimizer.param_groups[0]["lr"],
+                "odam_loss_weight_effective": odam_loss_weight_effective,
                 **train_metrics,
                 **val_metrics,
             }
@@ -1101,6 +1159,10 @@ def main():
         if args.test_after_train and distributed.is_main:
             checkpoint_path = output_dir / f"{args.test_checkpoint}.pt"
             checkpoint_epoch = load_model_checkpoint_for_eval(checkpoint_path, raw_model, device)
+            set_odam_loss_weight(
+                raw_model,
+                compute_odam_loss_weight(checkpoint_epoch, args),
+            )
             test_dataset_full = CocoDrillBitDataset(
                 args.data_root,
                 args.test_split,

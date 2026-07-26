@@ -77,6 +77,8 @@ Single-GPU/local command:
   --odam-nms-low-threshold 0.2 \
   --odam-nms-high-threshold 0.8 \
   --odam-nms-resize-short-edge 50 \
+  --odam-loss-start-epoch 4 \
+  --odam-loss-warmup-epochs 5 \
   --test-after-train \
   --test-checkpoint best
 ```
@@ -101,6 +103,8 @@ torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
   --odam-nms-low-threshold 0.2 \
   --odam-nms-high-threshold 0.8 \
   --odam-nms-resize-short-edge 50 \
+  --odam-loss-start-epoch 4 \
+  --odam-loss-warmup-epochs 5 \
   --test-after-train \
   --test-checkpoint best
 ```
@@ -116,6 +120,9 @@ paper's default ODAM-Train setting; disable with `--no-odam-nms` for classical
 IoU-only NMS ablations.
 `--odam-nms-resize-short-edge 50` matches the paper's heatmap-correlation
 preprocessing.
+`--odam-loss-start-epoch 4 --odam-loss-warmup-epochs 5` keeps the auxiliary
+ODAM loss off for epochs 1-3, then linearly ramps it to `--odam-loss-weight`
+from epochs 4-8 so the detector losses can stabilize first.
 
 ### Fair Baseline Command
 

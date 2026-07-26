@@ -122,6 +122,11 @@ class RCNN(nn.Module):
             fg_masks = labels > 0
             valid_masks = labels >= 0
             fg_gt_classes = labels[fg_masks]
+            odam_weight = getattr(config, "odam_loss_weight_effective", None)
+            if odam_weight is None:
+                odam_weight = getattr(config, "odam_loss_weight", 1.0)
+            odam_weight = float(odam_weight)
+            odam_enabled = odam_weight > 0.0
 
             # loss for regression
             # multi class
@@ -144,7 +149,7 @@ class RCNN(nn.Module):
                 odam_masks = fg_masks
                 if getattr(config, "odam_exclude_gt_rois", True):
                     odam_masks = fg_masks & ~roi_is_gt
-                if odam_masks.any():
+                if odam_enabled and odam_masks.any():
                     odam_gt_classes = labels[odam_masks]
                     odam_delta = pred_delta[odam_masks, odam_gt_classes, :]
                     odam_pred_bbox = restore_bbox(rcnn_rois[odam_masks, 1:5], odam_delta,
@@ -195,7 +200,7 @@ class RCNN(nn.Module):
             normalizer = 1.0 / valid_masks.sum().item()
             loss_rcnn_loc = localization_loss.sum() * normalizer
             loss_rcnn_cls = objectness_loss.sum() * normalizer
-            loss_rcnn_match = float(getattr(config, "odam_loss_weight", 1.0)) * loss_rcnn_match
+            loss_rcnn_match = odam_weight * loss_rcnn_match
 
             loss_dict = {}
             loss_dict['loss_rcnn_loc'] = loss_rcnn_loc
@@ -559,8 +564,6 @@ def match_loss(dams, objs, bids, pred_bbox, pred_gt_iou):
         return dams.sum() * 0.0
     loss = (-pos_sims.log().sum() - (1 - neg_sims).log().sum()) / pair_count
     return loss
-
-
 
 
 
