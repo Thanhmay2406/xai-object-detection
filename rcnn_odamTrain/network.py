@@ -54,7 +54,7 @@ class Network(nn.Module):
         rcnn_rois, rcnn_labels, rcnn_bbox_targets, rcnn_gts, rcnn_roi_is_gt = fpn_roi_target(
                 config, rpn_rois, im_info, gt_boxes, top_k=1, return_roi_is_gt=True)
         loss_dict_rcnn = self.RCNN(fpn_fms, rcnn_rois,
-                rcnn_labels, rcnn_bbox_targets, rcnn_gts, rcnn_roi_is_gt)
+                rcnn_labels, rcnn_bbox_targets, rcnn_gts, rcnn_roi_is_gt, im_info=im_info)
         loss_dict.update(loss_dict_rpn)
         loss_dict.update(loss_dict_rcnn)
         return loss_dict
@@ -86,9 +86,14 @@ class RCNN(nn.Module):
         for l in [self.pred_delta]:
             nn.init.normal_(l.weight, std=0.001)
             nn.init.constant_(l.bias, 0)
+        self.sab_odam = (
+            ScaleAdaptiveODAM(config)
+            if bool(getattr(config, "sab_odam", False))
+            else None
+        )
 
     @torch.enable_grad()
-    def forward(self, fpn_fms, rcnn_rois, labels=None, bbox_targets=None, assigned_gts=None, roi_is_gt=None):
+    def forward(self, fpn_fms, rcnn_rois, labels=None, bbox_targets=None, assigned_gts=None, roi_is_gt=None, im_info=None):
         config = self.config
         bbox_stds, bbox_means = config.bbox_normalize_stds, config.bbox_normalize_means
         # input p2-p5
@@ -158,41 +163,59 @@ class RCNN(nn.Module):
                             bbox_stds, bbox_means, True)
                     odam_pred_gt_ious = paired_box_overlap_opr(odam_pred_bbox, odam_gt_bbox)
 
-                    target_scores = F.softmax(pred_cls, dim=-1) if getattr(config, "odam_use_confidence_target", True) else pred_cls
-                    pool_grads = self.get_gradient(
-                        target_scores,
-                        pool_features,
-                        create_graph=getattr(config, "odam_create_graph", True),
-                    ) # N, C-1, 256, 7,7
-                    pool_grads = smooth_pool_grads(
-                        pool_grads,
-                        int(getattr(config, "odam_smooth_kernel", 3)),
-                    )
-                    odam_inds = odam_masks.nonzero(as_tuple=True)[0]
-                    pool_dams = F.relu((pool_grads[odam_inds, odam_gt_classes-1,:,:,:] *
-                        pool_features[odam_masks]).sum(1)) # Num_pred,7,7
-
-                    dam_size = fpn_fms[2].size()[-2:] # image_size // 16
-                    rois_odam = rcnn_rois[odam_masks, 1:5]
-                    bids = rcnn_rois[odam_masks, 0].long()
-                    level_assignments_odam = level_assignments[odam_masks]
-
-                    pred_dams = get_dams(
-                        pool_dams, bids, rois_odam, fpn_fms, stride, level_assignments_odam, dam_size)
-
                     assigned_gts_odam = assigned_gts[odam_masks]
-                    loss_rcnn_match = match_loss(
-                        pred_dams,
-                        assigned_gts_odam,
-                        bids,
-                        odam_pred_bbox,
-                        odam_pred_gt_ious,
-                    )
+                    bids = rcnn_rois[odam_masks, 0].long()
+                    rois_odam = rcnn_rois[odam_masks, 1:5]
+                    if self.sab_odam is not None:
+                        sab_losses = self.sab_odam(
+                            self,
+                            fpn_fms,
+                            stride,
+                            rcnn_rois[odam_masks],
+                            odam_gt_classes,
+                            assigned_gts_odam,
+                            odam_pred_bbox,
+                            odam_gt_bbox,
+                            odam_pred_gt_ious,
+                            pred_cls[odam_masks],
+                            im_info,
+                        )
+                        loss_rcnn_match = sab_losses.pop("loss_sab_match")
+                    else:
+                        target_scores = F.softmax(pred_cls, dim=-1) if getattr(config, "odam_use_confidence_target", True) else pred_cls
+                        pool_grads = self.get_gradient(
+                            target_scores,
+                            pool_features,
+                            create_graph=getattr(config, "odam_create_graph", True),
+                        ) # N, C-1, 256, 7,7
+                        pool_grads = smooth_pool_grads(
+                            pool_grads,
+                            int(getattr(config, "odam_smooth_kernel", 3)),
+                        )
+                        odam_inds = odam_masks.nonzero(as_tuple=True)[0]
+                        pool_dams = F.relu((pool_grads[odam_inds, odam_gt_classes-1,:,:,:] *
+                            pool_features[odam_masks]).sum(1)) # Num_pred,7,7
+
+                        dam_size = fpn_fms[2].size()[-2:] # image_size // 16
+                        level_assignments_odam = level_assignments[odam_masks]
+
+                        pred_dams = get_dams(
+                            pool_dams, bids, rois_odam, fpn_fms, stride, level_assignments_odam, dam_size)
+
+                        loss_rcnn_match = match_loss(
+                            pred_dams,
+                            assigned_gts_odam,
+                            bids,
+                            odam_pred_bbox,
+                            odam_pred_gt_ious,
+                        )
                 else:
                     loss_rcnn_match = pred_delta_fg.sum() * 0.0
+                    sab_losses = {}
             else:
                 localization_loss = pred_delta.sum() * 0.0
                 loss_rcnn_match = pred_delta.sum() * 0.0
+                sab_losses = {}
 
             # loss for classification
             objectness_loss = softmax_loss(pred_cls, labels)
@@ -201,11 +224,13 @@ class RCNN(nn.Module):
             loss_rcnn_loc = localization_loss.sum() * normalizer
             loss_rcnn_cls = objectness_loss.sum() * normalizer
             loss_rcnn_match = odam_weight * loss_rcnn_match
+            sab_losses = {key: odam_weight * value for key, value in sab_losses.items()}
 
             loss_dict = {}
             loss_dict['loss_rcnn_loc'] = loss_rcnn_loc
             loss_dict['loss_rcnn_cls'] = loss_rcnn_cls
             loss_dict['loss_rcnn_match'] = loss_rcnn_match
+            loss_dict.update(sab_losses)
 
             return loss_dict
         else:
@@ -268,6 +293,360 @@ class RCNN(nn.Module):
                 grads.append(grad)
 
         return torch.stack(grads, dim=1)  # N, C-1, 256, 7,7
+
+
+class ScaleAdaptiveODAM(nn.Module):
+    """Training-only SAB-ODAM explanation branch.
+
+    The detector head remains the standard 7x7 Faster R-CNN head. This module
+    reuses the same head on multi-level explanation RoI features to generate
+    attribute-specific ODAM maps and auxiliary losses.
+    """
+
+    attr_count = 5
+    level_count = 4
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        hidden_dim = int(getattr(config, "sab_gate_hidden_dim", 32))
+        embed_dim = int(getattr(config, "sab_gate_embed_dim", 8))
+        self.attr_embedding = nn.Embedding(self.attr_count, embed_dim)
+        self.level_embedding = nn.Embedding(self.level_count, embed_dim)
+        self.scale_gate = nn.Sequential(
+            nn.Linear(3 + embed_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        rcnn,
+        fpn_fms,
+        stride,
+        rois,
+        gt_classes,
+        assigned_gts,
+        pred_bbox,
+        gt_bbox,
+        pred_gt_iou,
+        pred_cls,
+        im_info,
+    ):
+        keep = select_sab_rois(
+            assigned_gts,
+            pred_gt_iou,
+            int(getattr(self.config, "sab_topk_per_gt", 2)),
+            int(getattr(self.config, "sab_max_rois_per_batch", 32)),
+        )
+        if keep.numel() == 0:
+            zero = pred_cls.sum() * 0.0
+            return {
+                "loss_sab_match": zero,
+                "loss_sab_scale": zero,
+                "loss_sab_edge": zero,
+                "loss_sab_inside": zero,
+            }
+
+        rois = rois[keep]
+        gt_classes = gt_classes[keep].long()
+        assigned_gts = assigned_gts[keep]
+        pred_bbox = pred_bbox[keep]
+        gt_bbox = gt_bbox[keep]
+        pred_gt_iou = pred_gt_iou[keep]
+        pred_cls = pred_cls[keep]
+
+        fpn_p2_to_p5 = fpn_fms
+        strides_p2_to_p5 = stride
+        area_ratio, aspect, resolution, allowed_levels = analyze_sab_scale(
+            rois,
+            im_info,
+            float(getattr(self.config, "sab_small_area_threshold", 0.0025)),
+            float(getattr(self.config, "sab_medium_area_threshold", 0.0225)),
+            int(getattr(self.config, "sab_small_resolution", 28)),
+            int(getattr(self.config, "sab_medium_resolution", 14)),
+            int(getattr(self.config, "sab_large_resolution", 7)),
+        )
+        max_resolution = int(max(
+            getattr(self.config, "sab_small_resolution", 28),
+            getattr(self.config, "sab_medium_resolution", 14),
+            getattr(self.config, "sab_large_resolution", 7),
+        ))
+        if max_resolution < 7:
+            max_resolution = 7
+
+        level_heatmaps = []
+        create_graph = bool(getattr(self.config, "odam_create_graph", True))
+        smooth_kernel = int(getattr(self.config, "odam_smooth_kernel", 3))
+        with torch.enable_grad():
+            for fm_level, scale_level in zip(fpn_p2_to_p5, strides_p2_to_p5):
+                fm_level = fm_level.float() if bool(getattr(self.config, "sab_force_fp32", True)) else fm_level
+                roi_features = roi_align(
+                    fm_level,
+                    rois,
+                    (max_resolution, max_resolution),
+                    spatial_scale=1.0 / scale_level,
+                    sampling_ratio=-1,
+                    aligned=True,
+                )
+                head_features = F.adaptive_avg_pool2d(roi_features, (7, 7))
+                flat = torch.flatten(head_features, start_dim=1)
+                flat = F.relu(rcnn.fc1(flat))
+                flat = F.relu(rcnn.fc2(flat))
+                cls_logits = rcnn.pred_cls(flat)
+                box_delta = rcnn.pred_delta(flat).reshape(
+                    -1,
+                    self.config.num_classes,
+                    4,
+                )
+
+                row_ids = torch.arange(len(gt_classes), device=gt_classes.device)
+                if bool(getattr(self.config, "sab_use_confidence_target", True)):
+                    cls_target = F.softmax(cls_logits, dim=-1)[row_ids, gt_classes]
+                else:
+                    cls_target = cls_logits[row_ids, gt_classes]
+                box_targets = box_delta[row_ids, gt_classes, :]
+                attr_targets = [cls_target] + [box_targets[:, idx] for idx in range(4)]
+
+                attr_heatmaps = []
+                for attr_target in attr_targets:
+                    grad = torch.autograd.grad(
+                        attr_target.sum(),
+                        roi_features,
+                        retain_graph=True,
+                        create_graph=create_graph,
+                        allow_unused=True,
+                    )[0]
+                    if grad is None:
+                        grad = roi_features.new_zeros(roi_features.shape)
+                    grad = smooth_pool_grads(grad[:, None, :, :, :], smooth_kernel)[:, 0]
+                    heatmap = F.relu((grad * roi_features).sum(1))
+                    heatmap = apply_sab_resolution(heatmap, resolution, max_resolution)
+                    attr_heatmaps.append(normalize_heatmaps(heatmap))
+                level_heatmaps.append(torch.stack(attr_heatmaps, dim=1))
+
+        level_heatmaps = torch.stack(level_heatmaps, dim=2)
+        scale_weights = self.compute_scale_weights(
+            area_ratio,
+            aspect,
+            pred_cls,
+            gt_classes,
+            allowed_levels,
+        )
+        fused_heatmaps = (level_heatmaps * scale_weights[..., None, None]).sum(2)
+        fused_heatmaps = normalize_heatmaps(fused_heatmaps)
+
+        flat_cls_heatmaps = fused_heatmaps[:, 0].reshape(len(fused_heatmaps), -1)
+        loss_match = float(getattr(self.config, "sab_lambda_match", 1.0)) * match_loss(
+            flat_cls_heatmaps,
+            assigned_gts,
+            rois[:, 0].long(),
+            pred_bbox,
+            pred_gt_iou,
+        )
+
+        instance_weights = small_object_weights(
+            area_ratio,
+            float(getattr(self.config, "sab_small_weight_ref_area", 0.0025)),
+            float(getattr(self.config, "sab_small_weight_gamma", 0.0)),
+            float(getattr(self.config, "sab_small_weight_max", 3.0)),
+        )
+        loss_scale = float(getattr(self.config, "sab_lambda_scale", 0.1)) * scale_consistency_loss(
+            level_heatmaps,
+            fused_heatmaps,
+            scale_weights,
+            allowed_levels,
+            instance_weights,
+        )
+        box_mask, edge_masks = make_roi_boundary_masks(
+            fused_heatmaps,
+            rois[:, 1:5],
+            gt_bbox,
+            float(getattr(self.config, "sab_boundary_band_ratio", 0.08)),
+        )
+        loss_edge = float(getattr(self.config, "sab_lambda_edge", 0.1)) * boundary_energy_loss(
+            fused_heatmaps[:, 1:5],
+            edge_masks,
+            instance_weights,
+        )
+        loss_inside = float(getattr(self.config, "sab_lambda_inside", 0.05)) * inside_energy_loss(
+            fused_heatmaps[:, 0],
+            box_mask,
+            instance_weights,
+        )
+        return {
+            "loss_sab_match": loss_match,
+            "loss_sab_scale": loss_scale,
+            "loss_sab_edge": loss_edge,
+            "loss_sab_inside": loss_inside,
+        }
+
+    def compute_scale_weights(self, area_ratio, aspect, pred_cls, gt_classes, allowed_levels):
+        row_ids = torch.arange(len(gt_classes), device=gt_classes.device)
+        confidence = F.softmax(pred_cls.detach(), dim=-1)[row_ids, gt_classes].clamp(0.0, 1.0)
+        base = torch.stack(
+            (
+                torch.log(area_ratio.clamp(min=1e-8)),
+                torch.log(aspect.clamp(min=1e-8)),
+                confidence,
+            ),
+            dim=1,
+        )
+        attr_ids = torch.arange(self.attr_count, device=base.device)
+        level_ids = torch.arange(self.level_count, device=base.device)
+        attr_embed = self.attr_embedding(attr_ids)
+        level_embed = self.level_embedding(level_ids)
+        inputs = torch.cat(
+            (
+                base[:, None, None, :].expand(-1, self.attr_count, self.level_count, -1),
+                attr_embed[None, :, None, :].expand(len(base), -1, self.level_count, -1),
+                level_embed[None, None, :, :].expand(len(base), self.attr_count, -1, -1),
+            ),
+            dim=-1,
+        )
+        logits = self.scale_gate(inputs).squeeze(-1)
+        logits = logits.masked_fill(~allowed_levels[:, None, :], -10000.0)
+        return F.softmax(logits, dim=2)
+
+
+def select_sab_rois(assigned_gts, pred_gt_iou, topk_per_gt, max_rois):
+    if assigned_gts.numel() == 0:
+        return assigned_gts.new_zeros((0,), dtype=torch.long)
+    selected = []
+    topk_per_gt = max(1, int(topk_per_gt))
+    for gt_id in assigned_gts.unique(sorted=True):
+        inds = torch.nonzero(assigned_gts == gt_id, as_tuple=False).flatten()
+        if inds.numel() == 0:
+            continue
+        order = pred_gt_iou[inds].argsort(descending=True)
+        selected.append(inds[order[:topk_per_gt]])
+    if not selected:
+        return assigned_gts.new_zeros((0,), dtype=torch.long)
+    keep = torch.cat(selected, dim=0)
+    if int(max_rois) > 0 and keep.numel() > int(max_rois):
+        order = pred_gt_iou[keep].argsort(descending=True)
+        keep = keep[order[: int(max_rois)]]
+    return keep
+
+
+def analyze_sab_scale(rois, im_info, small_threshold, medium_threshold, small_res, medium_res, large_res):
+    boxes = rois[:, 1:5]
+    widths = (boxes[:, 2] - boxes[:, 0]).clamp(min=1.0)
+    heights = (boxes[:, 3] - boxes[:, 1]).clamp(min=1.0)
+    bids = rois[:, 0].long()
+    image_area = (im_info[bids, 0] * im_info[bids, 1]).clamp(min=1.0)
+    area_ratio = (widths * heights / image_area).clamp(min=1e-8)
+    aspect = (widths / heights).clamp(min=1e-8)
+    small = area_ratio < small_threshold
+    medium = (area_ratio >= small_threshold) & (area_ratio < medium_threshold)
+    resolution = rois.new_full((len(rois),), float(large_res))
+    resolution = torch.where(medium, resolution.new_full(resolution.shape, float(medium_res)), resolution)
+    resolution = torch.where(small, resolution.new_full(resolution.shape, float(small_res)), resolution)
+    allowed = torch.zeros((len(rois), 4), dtype=torch.bool, device=rois.device)
+    allowed[small, 0:2] = True
+    allowed[medium, 0:3] = True
+    allowed[~(small | medium), 1:4] = True
+    return area_ratio, aspect, resolution.long(), allowed
+
+
+def apply_sab_resolution(heatmaps, resolution, max_resolution):
+    if heatmaps.numel() == 0:
+        return heatmaps
+    output = heatmaps
+    for res in resolution.unique(sorted=True):
+        res_int = int(res.item())
+        if res_int == int(max_resolution):
+            continue
+        inds = torch.nonzero(resolution == res, as_tuple=False).flatten()
+        if inds.numel() == 0:
+            continue
+        down = F.interpolate(
+            heatmaps[inds, None],
+            size=(res_int, res_int),
+            mode="bilinear",
+            align_corners=False,
+        )
+        up = F.interpolate(
+            down,
+            size=(max_resolution, max_resolution),
+            mode="bilinear",
+            align_corners=False,
+        )[:, 0]
+        if output is heatmaps:
+            output = heatmaps.clone()
+        output[inds] = up
+    return output
+
+
+def normalize_heatmaps(heatmaps):
+    flat = heatmaps.reshape(*heatmaps.shape[:-2], -1)
+    flat = F.normalize(flat, p=2, dim=-1, eps=1e-12)
+    return flat.reshape_as(heatmaps)
+
+
+def small_object_weights(area_ratio, ref_area, gamma, max_weight):
+    if gamma <= 0.0:
+        return area_ratio.new_ones(area_ratio.shape)
+    weights = (float(ref_area) / area_ratio.clamp(min=1e-8)).pow(float(gamma))
+    weights = weights.clamp(max=float(max_weight))
+    return weights / weights.mean().detach().clamp(min=1e-8)
+
+
+def weighted_mean(values, weights):
+    return (values * weights).sum() / weights.sum().clamp(min=1e-8)
+
+
+def scale_consistency_loss(level_heatmaps, fused_heatmaps, scale_weights, allowed_levels, instance_weights):
+    level_flat = level_heatmaps.reshape(*level_heatmaps.shape[:3], -1)
+    fused_flat = fused_heatmaps.reshape(*fused_heatmaps.shape[:2], -1)
+    cosine = (level_flat * fused_flat[:, :, None, :]).sum(-1)
+    losses = (1.0 - cosine).clamp(min=0.0) * scale_weights
+    losses = losses * allowed_levels[:, None, :].to(dtype=losses.dtype)
+    per_instance = losses.sum((1, 2)) / allowed_levels.sum(1).clamp(min=1) / level_heatmaps.shape[1]
+    return weighted_mean(per_instance, instance_weights)
+
+
+def make_roi_boundary_masks(reference_heatmaps, rois, gt_bbox, band_ratio):
+    _, _, height, width = reference_heatmaps.shape
+    device = reference_heatmaps.device
+    dtype = reference_heatmaps.dtype
+    y = torch.arange(height, dtype=dtype, device=device).reshape(1, height, 1)
+    x = torch.arange(width, dtype=dtype, device=device).reshape(1, 1, width)
+    roi_w = (rois[:, 2] - rois[:, 0]).clamp(min=1.0)
+    roi_h = (rois[:, 3] - rois[:, 1]).clamp(min=1.0)
+    gx1 = ((gt_bbox[:, 0] - rois[:, 0]) / roi_w * (width - 1)).clamp(0, width - 1)
+    gy1 = ((gt_bbox[:, 1] - rois[:, 1]) / roi_h * (height - 1)).clamp(0, height - 1)
+    gx2 = ((gt_bbox[:, 2] - rois[:, 0]) / roi_w * (width - 1)).clamp(0, width - 1)
+    gy2 = ((gt_bbox[:, 3] - rois[:, 1]) / roi_h * (height - 1)).clamp(0, height - 1)
+    left = torch.minimum(gx1, gx2).reshape(-1, 1, 1)
+    right = torch.maximum(gx1, gx2).reshape(-1, 1, 1)
+    top = torch.minimum(gy1, gy2).reshape(-1, 1, 1)
+    bottom = torch.maximum(gy1, gy2).reshape(-1, 1, 1)
+    inside_x = ((x >= left) & (x <= right)).to(dtype)
+    inside_y = ((y >= top) & (y <= bottom)).to(dtype)
+    box_mask = inside_x * inside_y
+    band_x = ((right - left).clamp(min=1.0) * float(band_ratio)).clamp(min=1.0)
+    band_y = ((bottom - top).clamp(min=1.0) * float(band_ratio)).clamp(min=1.0)
+    left_mask = torch.exp(-0.5 * ((x - left) / band_x).pow(2)) * inside_y
+    right_mask = torch.exp(-0.5 * ((x - right) / band_x).pow(2)) * inside_y
+    top_mask = torch.exp(-0.5 * ((y - top) / band_y).pow(2)) * inside_x
+    bottom_mask = torch.exp(-0.5 * ((y - bottom) / band_y).pow(2)) * inside_x
+    edge_masks = torch.stack((left_mask, top_mask, right_mask, bottom_mask), dim=1)
+    return box_mask, edge_masks
+
+
+def boundary_energy_loss(edge_heatmaps, edge_masks, instance_weights):
+    numerator = (edge_heatmaps * edge_masks).flatten(2).sum(-1)
+    denominator = edge_heatmaps.flatten(2).sum(-1).clamp(min=1e-8)
+    per_attr = 1.0 - numerator / denominator
+    return weighted_mean(per_attr.mean(1), instance_weights)
+
+
+def inside_energy_loss(class_heatmaps, box_mask, instance_weights):
+    numerator = (class_heatmaps * box_mask).flatten(1).sum(-1)
+    denominator = class_heatmaps.flatten(1).sum(-1).clamp(min=1e-8)
+    return weighted_mean(1.0 - numerator / denominator, instance_weights)
+
 
 def smooth_pool_grads(pool_grads, kernel_size):
     if kernel_size <= 1:
@@ -564,6 +943,3 @@ def match_loss(dams, objs, bids, pred_bbox, pred_gt_iou):
         return dams.sum() * 0.0
     loss = (-pos_sims.log().sum() - (1 - neg_sims).log().sum()) / pair_count
     return loss
-
-
-

@@ -75,6 +75,26 @@ class TrainConfig:
     odam_use_confidence_target: bool = True
     odam_exclude_gt_rois: bool = True
     backbone_weights: str = "none"
+    sab_odam: bool = False
+    sab_small_area_threshold: float = 0.0025
+    sab_medium_area_threshold: float = 0.0225
+    sab_small_resolution: int = 28
+    sab_medium_resolution: int = 14
+    sab_large_resolution: int = 7
+    sab_topk_per_gt: int = 2
+    sab_max_rois_per_batch: int = 32
+    sab_lambda_match: float = 1.0
+    sab_lambda_scale: float = 0.1
+    sab_lambda_edge: float = 0.1
+    sab_lambda_inside: float = 0.05
+    sab_boundary_band_ratio: float = 0.08
+    sab_small_weight_ref_area: float = 0.0025
+    sab_small_weight_gamma: float = 0.0
+    sab_small_weight_max: float = 3.0
+    sab_gate_hidden_dim: int = 32
+    sab_gate_embed_dim: int = 8
+    sab_force_fp32: bool = True
+    sab_use_confidence_target: bool = True
 
 
 class CocoDrillBitDataset(Dataset):
@@ -241,6 +261,26 @@ def make_config(args, mapping):
         odam_use_confidence_target=args.odam_use_confidence_target,
         odam_exclude_gt_rois=args.odam_exclude_gt_rois,
         backbone_weights=args.backbone_weights,
+        sab_odam=args.sab_odam,
+        sab_small_area_threshold=args.sab_small_area_threshold,
+        sab_medium_area_threshold=args.sab_medium_area_threshold,
+        sab_small_resolution=args.sab_small_resolution,
+        sab_medium_resolution=args.sab_medium_resolution,
+        sab_large_resolution=args.sab_large_resolution,
+        sab_topk_per_gt=args.sab_topk_per_gt,
+        sab_max_rois_per_batch=args.sab_max_rois_per_batch,
+        sab_lambda_match=args.sab_lambda_match,
+        sab_lambda_scale=args.sab_lambda_scale,
+        sab_lambda_edge=args.sab_lambda_edge,
+        sab_lambda_inside=args.sab_lambda_inside,
+        sab_boundary_band_ratio=args.sab_boundary_band_ratio,
+        sab_small_weight_ref_area=args.sab_small_weight_ref_area,
+        sab_small_weight_gamma=args.sab_small_weight_gamma,
+        sab_small_weight_max=args.sab_small_weight_max,
+        sab_gate_hidden_dim=args.sab_gate_hidden_dim,
+        sab_gate_embed_dim=args.sab_gate_embed_dim,
+        sab_force_fp32=args.sab_force_fp32,
+        sab_use_confidence_target=args.sab_use_confidence_target,
     )
 
 
@@ -864,6 +904,51 @@ def parse_args():
         default=True,
         help="Exclude GT-appended ROIs from the ODAM auxiliary pair loss.",
     )
+    parser.add_argument(
+        "--sab-odam",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the Scale-Adaptive Boundary-Aware ODAM training branch.",
+    )
+    parser.add_argument("--sab-small-area-threshold", type=float, default=0.0025)
+    parser.add_argument("--sab-medium-area-threshold", type=float, default=0.0225)
+    parser.add_argument("--sab-small-resolution", type=int, default=28)
+    parser.add_argument("--sab-medium-resolution", type=int, default=14)
+    parser.add_argument("--sab-large-resolution", type=int, default=7)
+    parser.add_argument(
+        "--sab-topk-per-gt",
+        type=int,
+        default=2,
+        help="Maximum SAB positive proposals kept per assigned GT object.",
+    )
+    parser.add_argument(
+        "--sab-max-rois-per-batch",
+        type=int,
+        default=32,
+        help="Global SAB proposal cap per batch/rank. Use <=0 for no cap.",
+    )
+    parser.add_argument("--sab-lambda-match", type=float, default=1.0)
+    parser.add_argument("--sab-lambda-scale", type=float, default=0.1)
+    parser.add_argument("--sab-lambda-edge", type=float, default=0.1)
+    parser.add_argument("--sab-lambda-inside", type=float, default=0.05)
+    parser.add_argument("--sab-boundary-band-ratio", type=float, default=0.08)
+    parser.add_argument("--sab-small-weight-ref-area", type=float, default=0.0025)
+    parser.add_argument("--sab-small-weight-gamma", type=float, default=0.0)
+    parser.add_argument("--sab-small-weight-max", type=float, default=3.0)
+    parser.add_argument("--sab-gate-hidden-dim", type=int, default=32)
+    parser.add_argument("--sab-gate-embed-dim", type=int, default=8)
+    parser.add_argument(
+        "--sab-force-fp32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run the SAB explanation branch in fp32 even when AMP is enabled.",
+    )
+    parser.add_argument(
+        "--sab-use-confidence-target",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use class confidence rather than raw class logit for SAB class heatmaps.",
+    )
     parser.add_argument("--rpn-pre-nms-topk", type=int, default=1000)
     parser.add_argument("--rpn-post-nms-topk", type=int, default=300)
     parser.add_argument(
@@ -919,6 +1004,35 @@ def main():
         raise ValueError("--odam-loss-warmup-epochs must be >= 0")
     if args.odam_smooth_kernel < 1:
         raise ValueError("--odam-smooth-kernel must be >= 1")
+    if args.sab_small_area_threshold <= 0.0:
+        raise ValueError("--sab-small-area-threshold must be > 0")
+    if args.sab_medium_area_threshold <= args.sab_small_area_threshold:
+        raise ValueError("--sab-medium-area-threshold must be > --sab-small-area-threshold")
+    for name in ("sab_small_resolution", "sab_medium_resolution", "sab_large_resolution"):
+        if getattr(args, name) < 7:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 7")
+    if args.sab_topk_per_gt < 1:
+        raise ValueError("--sab-topk-per-gt must be >= 1")
+    if args.sab_lambda_match < 0.0:
+        raise ValueError("--sab-lambda-match must be >= 0")
+    if args.sab_lambda_scale < 0.0:
+        raise ValueError("--sab-lambda-scale must be >= 0")
+    if args.sab_lambda_edge < 0.0:
+        raise ValueError("--sab-lambda-edge must be >= 0")
+    if args.sab_lambda_inside < 0.0:
+        raise ValueError("--sab-lambda-inside must be >= 0")
+    if args.sab_boundary_band_ratio <= 0.0:
+        raise ValueError("--sab-boundary-band-ratio must be > 0")
+    if args.sab_small_weight_ref_area <= 0.0:
+        raise ValueError("--sab-small-weight-ref-area must be > 0")
+    if args.sab_small_weight_gamma < 0.0:
+        raise ValueError("--sab-small-weight-gamma must be >= 0")
+    if args.sab_small_weight_max < 1.0:
+        raise ValueError("--sab-small-weight-max must be >= 1")
+    if args.sab_gate_hidden_dim < 1:
+        raise ValueError("--sab-gate-hidden-dim must be >= 1")
+    if args.sab_gate_embed_dim < 1:
+        raise ValueError("--sab-gate-embed-dim must be >= 1")
     distributed = setup_distributed(should_enable_distributed(args.distributed))
     seed_everything(args.seed)
     try:

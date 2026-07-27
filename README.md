@@ -124,6 +124,57 @@ preprocessing.
 ODAM loss off for epochs 1-3, then linearly ramps it to `--odam-loss-weight`
 from epochs 4-8 so the detector losses can stabilize first.
 
+### Run SAB-ODAM Improved Architecture
+
+`SAB-ODAM` implements the training-time improvement described in
+`SAB_ODAM_kien_truc_cai_tien.md`: the Faster R-CNN detection branch still uses
+the standard `7x7` RoI head, while the auxiliary explanation branch uses
+scale-adaptive multi-level FPN RoIAlign, attribute-specific scale fusion, cross
+scale consistency, class-inside-object loss, and boundary-aware losses for
+`x1/y1/x2/y2` heatmaps.
+
+Two-GPU scratch command for fair comparison against a scratch Faster R-CNN
+baseline:
+
+```bash
+torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
+  --data-root data/drill_bit_coco \
+  --output-dir results/sab_odam_train_scratch_ddp_20e \
+  --overwrite \
+  --backbone-weights none \
+  --epochs 20 \
+  --batch-size 4 \
+  --workers 2 \
+  --image-size 640 \
+  --amp \
+  --include-empty-categories \
+  --rpn-batch-size 256 \
+  --rpn-fg-fraction 0.5 \
+  --odam-nms \
+  --odam-nms-low-threshold 0.2 \
+  --odam-nms-high-threshold 0.8 \
+  --odam-nms-resize-short-edge 50 \
+  --odam-loss-start-epoch 4 \
+  --odam-loss-warmup-epochs 5 \
+  --sab-odam \
+  --sab-small-resolution 28 \
+  --sab-medium-resolution 14 \
+  --sab-large-resolution 7 \
+  --sab-topk-per-gt 2 \
+  --sab-max-rois-per-batch 32 \
+  --sab-lambda-match 1.0 \
+  --sab-lambda-scale 0.1 \
+  --sab-lambda-edge 0.1 \
+  --sab-lambda-inside 0.05 \
+  --sab-small-weight-gamma 0.5 \
+  --test-after-train \
+  --test-checkpoint best
+```
+
+The SAB metrics are written as separate columns in `metrics.csv`:
+`loss_sab_scale`, `loss_sab_edge`, and `loss_sab_inside`; the class heatmap
+consistency/separation component is reported through `loss_rcnn_match`.
+
 ### Fair Baseline Command
 
 ```bash
