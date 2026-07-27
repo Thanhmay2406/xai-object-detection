@@ -253,6 +253,53 @@ torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
   --test-checkpoint best
 ```
 
+For a controlled multi-arm ablation, generate the full command plan instead of
+copying commands by hand:
+
+```bash
+./.venv/bin/python rcnn_odamTrain/run_sab_ablation_plan.py \
+  --data-root data/drill_bit_coco \
+  --output-root results \
+  --plan-dir results/sab_ablation_plan \
+  --overwrite
+```
+
+This writes:
+
+- `results/sab_ablation_plan/commands.sh`
+- `results/sab_ablation_plan/ablation_plan.json`
+
+The default variants are:
+
+- `sab_ablation_match_only`: SAB match loss only.
+- `sab_ablation_match_scale`: match + scale consistency.
+- `sab_ablation_tuned_loss`: delayed warmup and weaker edge/inside losses.
+- `sab_ablation_late_light`: later, lighter SAB auxiliary supervision.
+
+To run all arms sequentially on a two-GPU Kaggle runtime:
+
+```bash
+pip install -q pycocotools
+
+./.venv/bin/python rcnn_odamTrain/run_sab_ablation_plan.py \
+  --data-root /kaggle/input/datasets/thanhmay2406/dataset-for-research/drill_bit_coco \
+  --output-root results \
+  --plan-dir results/sab_ablation_plan \
+  --overwrite \
+  --execute
+```
+
+To run only one arm:
+
+```bash
+./.venv/bin/python rcnn_odamTrain/run_sab_ablation_plan.py \
+  --data-root /kaggle/input/datasets/thanhmay2406/dataset-for-research/drill_bit_coco \
+  --variants tuned_loss \
+  --output-root results \
+  --overwrite \
+  --execute
+```
+
 ### Fair Baseline Command
 
 ```bash
