@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -133,11 +136,18 @@ def selected_variants(names: list[str]) -> list[AblationVariant]:
     return variants
 
 
+def repo_resolved_path(value: str | Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return REPO_ROOT / path
+
+
 def base_train_args(args: argparse.Namespace, output_dir: Path) -> list[str]:
     command = [
-        "rcnn_odamTrain/train.py",
+        str(REPO_ROOT / "rcnn_odamTrain" / "train.py"),
         "--data-root",
-        args.data_root,
+        str(repo_resolved_path(args.data_root)),
         "--output-dir",
         str(output_dir),
         "--backbone-weights",
@@ -192,7 +202,7 @@ def base_train_args(args: argparse.Namespace, output_dir: Path) -> list[str]:
 
 
 def full_command(args: argparse.Namespace, variant: AblationVariant) -> list[str]:
-    output_dir = Path(args.output_root) / variant.output_dir
+    output_dir = repo_resolved_path(args.output_root) / variant.output_dir
     train_args = base_train_args(args, output_dir)
     train_args.extend(variant.flags)
     if args.use_torchrun:
@@ -238,16 +248,21 @@ def write_plan(plan_dir: Path, variants: list[AblationVariant], commands: list[l
 
 def run_commands(args: argparse.Namespace, variants: list[AblationVariant], commands: list[list[str]]) -> None:
     for variant, command in zip(variants, commands):
-        output_dir = Path(args.output_root) / variant.output_dir
+        output_dir = repo_resolved_path(args.output_root) / variant.output_dir
         if args.skip_existing and (output_dir / "test_metrics.json").exists():
             print(f"skip variant={variant.name} existing={output_dir / 'test_metrics.json'}", flush=True)
             continue
         print(f"run variant={variant.name} command={shell_line(command)}", flush=True)
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, cwd=REPO_ROOT)
 
 
 def main() -> None:
     args = parse_args()
+    if args.execute and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise RuntimeError(
+            "Do not launch run_sab_ablation_plan.py with torchrun. "
+            "Run it once with python; this runner launches torchrun for each training arm."
+        )
     if args.epochs < 1:
         raise ValueError("--epochs must be >= 1")
     if args.batch_size < 1:
@@ -259,7 +274,7 @@ def main() -> None:
 
     variants = selected_variants(args.variants)
     commands = [full_command(args, variant) for variant in variants]
-    plan_dir = Path(args.plan_dir)
+    plan_dir = repo_resolved_path(args.plan_dir)
     write_plan(plan_dir, variants, commands, args)
 
     print(f"wrote_plan={plan_dir / 'ablation_plan.json'}", flush=True)

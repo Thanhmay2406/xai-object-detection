@@ -281,6 +281,7 @@ To run all arms sequentially on a two-GPU Kaggle runtime:
 ```bash
 pip install -q pycocotools
 
+cd /kaggle/working/xai-object-detection
 ./.venv/bin/python rcnn_odamTrain/run_sab_ablation_plan.py \
   --data-root /kaggle/input/datasets/thanhmay2406/dataset-for-research/drill_bit_coco \
   --output-root results \
@@ -289,9 +290,13 @@ pip install -q pycocotools
   --execute
 ```
 
+Do not wrap `run_sab_ablation_plan.py` itself with `torchrun`; the runner
+launches `torchrun` internally for each ablation arm.
+
 To run only one arm:
 
 ```bash
+cd /kaggle/working/xai-object-detection
 ./.venv/bin/python rcnn_odamTrain/run_sab_ablation_plan.py \
   --data-root /kaggle/input/datasets/thanhmay2406/dataset-for-research/drill_bit_coco \
   --variants tuned_loss \
