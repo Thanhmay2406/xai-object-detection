@@ -593,12 +593,40 @@ def load_model_checkpoint_for_eval(path, model, device):
 
 def write_epoch_metrics(path, row):
     path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.is_file()
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=sorted(row))
-        if not exists:
+    row = {key: row.get(key, "") for key in sorted(row)}
+    if not path.exists() or path.stat().st_size == 0:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row))
             writer.writeheader()
-        writer.writerow({key: row.get(key, "") for key in sorted(row)})
+            writer.writerow(row)
+        return
+
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        existing_fieldnames = list(reader.fieldnames or [])
+        existing_rows = []
+        for existing_row in reader:
+            # Rows written by csv.DictWriter should not contain a None key. If a
+            # historical artifact is malformed, keep only named columns here and
+            # let the new clean schema take over for subsequent rows.
+            existing_row.pop(None, None)
+            existing_rows.append(existing_row)
+
+    fieldnames = sorted(set(existing_fieldnames).union(row))
+    if fieldnames == existing_fieldnames:
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+        return
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for existing_row in existing_rows:
+            writer.writerow({key: existing_row.get(key, "") for key in fieldnames})
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
+    tmp_path.replace(path)
 
 
 def build_loader(dataset, batch_size, workers, shuffle, sampler=None, pin_memory=None):

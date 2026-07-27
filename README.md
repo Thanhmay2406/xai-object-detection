@@ -175,6 +175,84 @@ The SAB metrics are written as separate columns in `metrics.csv`:
 `loss_sab_scale`, `loss_sab_edge`, and `loss_sab_inside`; the class heatmap
 consistency/separation component is reported through `loss_rcnn_match`.
 
+`metrics.csv` is written with a dynamically expanded header, so SAB columns that
+become available after the ODAM warmup are backfilled as empty values for earlier
+epochs instead of corrupting later rows.
+
+### SAB Inference Threshold Sweep
+
+After a SAB run finishes, tune post-processing from the existing checkpoint
+before launching another full training job. This sweep evaluates the same
+`best.pt` with multiple confidence/NMS settings and writes ranked COCO metrics
+without modifying the checkpoint or original train artifacts.
+
+```bash
+pip install -q pycocotools
+
+./.venv/bin/python rcnn_odamTrain/evaluate_threshold_sweep.py \
+  --data-root data/drill_bit_coco \
+  --checkpoint results/sab_odam_train/best.pt \
+  --output-dir results/sab_odam_train_threshold_sweep \
+  --overwrite \
+  --split test \
+  --workers 2 \
+  --score-thresholds 0.001 \
+  --pred-cls-thresholds 0.05 0.08 0.10 0.12 \
+  --rcnn-nms-thresholds 0.45 0.50 \
+  --detections-per-image 50 75 100
+```
+
+For a quick smoke run before evaluating the full test split, add
+`--max-images 80`. The main files are:
+
+- `threshold_sweep_results.csv`
+- `threshold_sweep_results.json`
+
+### SAB Lower Auxiliary-Loss Ablation
+
+If the sweep confirms that SAB keeps high recall but produces too many
+predictions, run a lower-pressure SAB ablation before changing the architecture.
+This keeps the same detector setup while reducing boundary/inside supervision
+and delaying the auxiliary loss:
+
+```bash
+torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
+  --data-root data/drill_bit_coco \
+  --output-dir results/sab_odam_train_tuned_loss \
+  --overwrite \
+  --backbone-weights default \
+  --epochs 30 \
+  --batch-size 4 \
+  --workers 2 \
+  --image-size 640 \
+  --lr 0.0025 \
+  --momentum 0.9 \
+  --weight-decay 0.0005 \
+  --step-size 8 \
+  --gamma 0.1 \
+  --amp \
+  --include-empty-categories \
+  --odam-nms \
+  --odam-nms-low-threshold 0.2 \
+  --odam-nms-high-threshold 0.8 \
+  --odam-nms-resize-short-edge 50 \
+  --odam-loss-start-epoch 6 \
+  --odam-loss-warmup-epochs 8 \
+  --sab-odam \
+  --sab-small-resolution 28 \
+  --sab-medium-resolution 14 \
+  --sab-large-resolution 7 \
+  --sab-topk-per-gt 2 \
+  --sab-max-rois-per-batch 32 \
+  --sab-lambda-match 1.0 \
+  --sab-lambda-scale 0.1 \
+  --sab-lambda-edge 0.03 \
+  --sab-lambda-inside 0.02 \
+  --sab-small-weight-gamma 0.5 \
+  --test-after-train \
+  --test-checkpoint best
+```
+
 ### Fair Baseline Command
 
 ```bash
