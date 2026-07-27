@@ -50,6 +50,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import tv_tensors
+from torchvision.models import ResNet50_Weights
 from torchvision.models.detection import (
     FasterRCNN_ResNet50_FPN_Weights,
     fasterrcnn_resnet50_fpn,
@@ -321,6 +322,12 @@ def create_model(
             weights_backbone=None,
             **model_kwargs,
         )
+    elif normalized_weights in {"imagenet", "backbone", "backbone-only"}:
+        model = fasterrcnn_resnet50_fpn(
+            weights=None,
+            weights_backbone=ResNet50_Weights.DEFAULT,
+            **model_kwargs,
+        )
     elif normalized_weights in {"coco", "default", "pretrained"}:
         model = fasterrcnn_resnet50_fpn(
             weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT,
@@ -329,7 +336,8 @@ def create_model(
     else:
         raise ValueError(
             "--weights must be one of: "
-            "coco, default, pretrained, none, random, scratch"
+            "coco, default, pretrained, imagenet, backbone, "
+            "backbone-only, none, random, scratch"
         )
 
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -1197,8 +1205,9 @@ def parse_args() -> argparse.Namespace:
         "--weights",
         default="coco",
         help=(
-            "coco/default/pretrained or "
-            "none/random/scratch"
+            "coco/default/pretrained for COCO detector weights, "
+            "imagenet/backbone/backbone-only for ImageNet backbone only, "
+            "or none/random/scratch"
         ),
     )
     parser.add_argument("--epochs", type=int, default=20)

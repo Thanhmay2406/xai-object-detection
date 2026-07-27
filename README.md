@@ -180,10 +180,10 @@ consistency/separation component is reported through `loss_rcnn_match`.
 ```bash
 ./.venv/bin/python baseline/train_faster_rcnn.py \
   --data-root data/drill_bit_coco \
-  --output-dir results/baseline/faster_rcnn_fixed \
+  --output-dir results/baseline/faster_rcnn_imagenet \
   --overwrite \
-  --weights coco \
-  --epochs 20 \
+  --weights imagenet \
+  --epochs 30 \
   --batch-size 4 \
   --workers 2 \
   --min-size 640 \
@@ -193,6 +193,12 @@ consistency/separation component is reported through `loss_rcnn_match`.
   --test-after-train \
   --test-checkpoint best
 ```
+
+`--weights imagenet` initializes only the ResNet50 backbone from ImageNet and
+keeps the RPN/RoI detector heads randomly initialized. This is the appropriate
+baseline setting when comparing against RCNN-ODAM or SAB-ODAM runs that use
+`--backbone-weights default`. Use `--weights coco` only as a COCO-pretrained
+detector upper-bound, not as a fair detector-training baseline.
 
 For two-GPU DDP, launch the same script with:
 
