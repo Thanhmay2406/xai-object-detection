@@ -124,6 +124,61 @@ preprocessing.
 ODAM loss off for epochs 1-3, then linearly ramps it to `--odam-loss-weight`
 from epochs 4-8 so the detector losses can stabilize first.
 
+### Run DP-ODAM
+
+`DP-ODAM` implements the first safe-training variant from
+`DP_ODAM_improvement_proposal.md`. It keeps ODAM-NMS, but makes the training
+loss more conservative by using reliable ROI mining, pair-quality weighting,
+NMS-aware hard negative pairs, ROI-classifier-only ODAM gradients, optional
+gradient conflict gating, adaptive norm cap, and a final detection recovery
+phase.
+
+Two-GPU Kaggle/T4x2 command:
+
+```bash
+torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
+  --data-root /kaggle/input/datasets/thanhmay2406/dataset-for-research/drill_bit_coco \
+  --output-dir /kaggle/working/results/dp_odam_train \
+  --overwrite \
+  --backbone-weights default \
+  --epochs 30 \
+  --batch-size 4 \
+  --workers 2 \
+  --image-size 640 \
+  --lr 0.0025 \
+  --momentum 0.9 \
+  --weight-decay 0.0005 \
+  --step-size 8 \
+  --gamma 0.1 \
+  --amp \
+  --include-empty-categories \
+  --rpn-batch-size 256 \
+  --rpn-fg-fraction 0.5 \
+  --odam-nms \
+  --odam-nms-low-threshold 0.2 \
+  --odam-nms-high-threshold 0.8 \
+  --odam-nms-resize-short-edge 50 \
+  --odam-loss-start-epoch 10 \
+  --odam-loss-warmup-epochs 5 \
+  --dp-odam \
+  --dp-odam-min-iou 0.5 \
+  --dp-odam-min-confidence 0.5 \
+  --dp-odam-topk-per-gt 2 \
+  --dp-odam-max-rois-per-batch 32 \
+  --dp-odam-negative-iou-threshold 0.1 \
+  --dp-odam-recovery-epochs 5 \
+  --dp-odam-gradient-gate \
+  --dp-odam-conflict-threshold 0.0 \
+  --dp-odam-adaptive-norm-cap \
+  --dp-odam-norm-ratio 0.1 \
+  --test-after-train \
+  --test-checkpoint best
+```
+
+For a lower-overhead first run, drop `--dp-odam-gradient-gate` and
+`--dp-odam-adaptive-norm-cap`; reliable mining, pair-quality weighting, branch
+isolation, and recovery phase remain active.
+
 ### Run SAB-ODAM Improved Architecture
 
 `SAB-ODAM` implements the training-time improvement described in

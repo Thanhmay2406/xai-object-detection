@@ -74,6 +74,17 @@ class TrainConfig:
     odam_create_graph: bool = True
     odam_use_confidence_target: bool = True
     odam_exclude_gt_rois: bool = True
+    dp_odam: bool = False
+    dp_odam_min_iou: float = 0.5
+    dp_odam_min_confidence: float = 0.5
+    dp_odam_min_rois: int = 2
+    dp_odam_topk_per_gt: int = 2
+    dp_odam_max_rois_per_batch: int = 32
+    dp_odam_adaptive_quality_weight: bool = True
+    dp_odam_negative_iou_threshold: float = 0.1
+    dp_odam_exclude_self_pairs: bool = True
+    dp_odam_detach_localization: bool = True
+    dp_odam_roi_classifier_only: bool = True
     backbone_weights: str = "none"
     sab_odam: bool = False
     sab_small_area_threshold: float = 0.0025
@@ -260,6 +271,17 @@ def make_config(args, mapping):
         odam_create_graph=args.odam_create_graph,
         odam_use_confidence_target=args.odam_use_confidence_target,
         odam_exclude_gt_rois=args.odam_exclude_gt_rois,
+        dp_odam=args.dp_odam,
+        dp_odam_min_iou=args.dp_odam_min_iou,
+        dp_odam_min_confidence=args.dp_odam_min_confidence,
+        dp_odam_min_rois=args.dp_odam_min_rois,
+        dp_odam_topk_per_gt=args.dp_odam_topk_per_gt,
+        dp_odam_max_rois_per_batch=args.dp_odam_max_rois_per_batch,
+        dp_odam_adaptive_quality_weight=args.dp_odam_adaptive_quality_weight,
+        dp_odam_negative_iou_threshold=args.dp_odam_negative_iou_threshold,
+        dp_odam_exclude_self_pairs=args.dp_odam_exclude_self_pairs,
+        dp_odam_detach_localization=args.dp_odam_detach_localization,
+        dp_odam_roi_classifier_only=args.dp_odam_roi_classifier_only,
         backbone_weights=args.backbone_weights,
         sab_odam=args.sab_odam,
         sab_small_area_threshold=args.sab_small_area_threshold,
@@ -414,6 +436,11 @@ def compute_odam_loss_weight(epoch, args):
     target_weight = float(args.odam_loss_weight)
     if target_weight <= 0.0:
         return 0.0
+    recovery_epochs = int(getattr(args, "dp_odam_recovery_epochs", 0))
+    if bool(getattr(args, "dp_odam", False)) and recovery_epochs > 0:
+        recovery_start = int(args.epochs) - recovery_epochs + 1
+        if epoch >= recovery_start:
+            return 0.0
     if epoch < int(args.odam_loss_start_epoch):
         return 0.0
     warmup_epochs = int(args.odam_loss_warmup_epochs)
@@ -429,7 +456,145 @@ def set_odam_loss_weight(model, weight):
     module.config.odam_loss_weight_effective = float(weight)
 
 
-def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, rank=0):
+def is_loss_key(key):
+    return str(key).startswith("loss_")
+
+
+def is_odam_loss_key(key):
+    return key == "loss_rcnn_match" or str(key).startswith("loss_sab_")
+
+
+def split_detection_and_odam_losses(losses):
+    det_loss = None
+    odam_loss = None
+    for key, value in losses.items():
+        if not is_loss_key(key):
+            continue
+        if is_odam_loss_key(key):
+            odam_loss = value if odam_loss is None else odam_loss + value
+        else:
+            det_loss = value if det_loss is None else det_loss + value
+    zero_source = next((value for value in losses.values() if torch.is_tensor(value)), None)
+    if zero_source is None:
+        raise ValueError("Model returned no tensor losses")
+    if det_loss is None:
+        det_loss = zero_source.sum() * 0.0
+    if odam_loss is None:
+        odam_loss = zero_source.sum() * 0.0
+    return det_loss, odam_loss
+
+
+def dp_odam_probe_parameters(model):
+    module = model.module if hasattr(model, "module") else model
+    allowed_prefixes = (
+        "RCNN.fc1.",
+        "RCNN.fc2.",
+        "RCNN.pred_cls.",
+    )
+    return [
+        param
+        for name, param in module.named_parameters()
+        if param.requires_grad and name.startswith(allowed_prefixes)
+    ]
+
+
+def gradient_alignment_stats(det_loss, odam_loss, parameters):
+    det_grads = torch.autograd.grad(
+        det_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    odam_grads = torch.autograd.grad(
+        odam_loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    device = det_loss.device
+    dtype = torch.float32
+    dot = torch.zeros((), device=device, dtype=dtype)
+    det_sq = torch.zeros((), device=device, dtype=dtype)
+    odam_sq = torch.zeros((), device=device, dtype=dtype)
+    used = torch.zeros((), device=device, dtype=dtype)
+    for det_grad, odam_grad in zip(det_grads, odam_grads):
+        if det_grad is None or odam_grad is None:
+            continue
+        det_flat = det_grad.detach().float().reshape(-1)
+        odam_flat = odam_grad.detach().float().reshape(-1)
+        dot = dot + (det_flat * odam_flat).sum()
+        det_sq = det_sq + det_flat.pow(2).sum()
+        odam_sq = odam_sq + odam_flat.pow(2).sum()
+        used = used + 1.0
+    det_norm = det_sq.sqrt()
+    odam_norm = odam_sq.sqrt()
+    cosine = dot / (det_norm * odam_norm + 1e-12)
+    finite = torch.isfinite(cosine) & torch.isfinite(det_norm) & torch.isfinite(odam_norm) & (used > 0)
+    if not bool(finite.detach().item()):
+        cosine = torch.zeros((), device=device, dtype=dtype)
+        det_norm = torch.zeros((), device=device, dtype=dtype)
+        odam_norm = torch.zeros((), device=device, dtype=dtype)
+    return cosine, det_norm, odam_norm, finite.to(dtype=dtype)
+
+
+def sync_dp_odam_stats(cosine, det_norm, odam_norm, finite, context):
+    if not context.enabled:
+        return cosine, det_norm, odam_norm, bool(finite.detach().item())
+    values = torch.stack((cosine, det_norm, odam_norm))
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values = values / float(context.world_size)
+    finite_min = finite.clone()
+    dist.all_reduce(finite_min, op=dist.ReduceOp.MIN)
+    return values[0], values[1], values[2], bool(finite_min.detach().item())
+
+
+def maybe_apply_dp_odam_gradient_gate(det_loss, odam_loss, model, args, context):
+    stats = {
+        "stat_dp_odam_grad_cosine": 0.0,
+        "stat_dp_odam_det_grad_norm": 0.0,
+        "stat_dp_odam_odam_grad_norm": 0.0,
+        "stat_dp_odam_grad_gate": 0.0,
+        "stat_dp_odam_grad_scale": 1.0,
+    }
+    if (
+        not bool(getattr(args, "dp_odam_gradient_gate", False))
+        or not bool(getattr(args, "dp_odam", False))
+        or float(odam_loss.detach()) == 0.0
+    ):
+        return det_loss + odam_loss, stats
+
+    parameters = dp_odam_probe_parameters(model)
+    if not parameters:
+        stats["stat_dp_odam_grad_gate"] = 1.0
+        stats["stat_dp_odam_grad_scale"] = 0.0
+        return det_loss, stats
+
+    cosine, det_norm, odam_norm, finite = gradient_alignment_stats(det_loss, odam_loss, parameters)
+    cosine, det_norm, odam_norm, finite_bool = sync_dp_odam_stats(
+        cosine,
+        det_norm,
+        odam_norm,
+        finite,
+        context,
+    )
+    stats["stat_dp_odam_grad_cosine"] = float(cosine.detach())
+    stats["stat_dp_odam_det_grad_norm"] = float(det_norm.detach())
+    stats["stat_dp_odam_odam_grad_norm"] = float(odam_norm.detach())
+
+    if (not finite_bool) or float(cosine.detach()) < float(args.dp_odam_conflict_threshold):
+        stats["stat_dp_odam_grad_gate"] = 1.0
+        stats["stat_dp_odam_grad_scale"] = 0.0
+        return det_loss, stats
+
+    scale = 1.0
+    if bool(getattr(args, "dp_odam_adaptive_norm_cap", False)):
+        ratio = float(args.dp_odam_norm_ratio) * float(det_norm.detach()) / (float(odam_norm.detach()) + 1e-12)
+        scale = min(1.0, max(0.0, ratio))
+    stats["stat_dp_odam_grad_scale"] = scale
+    return det_loss + odam_loss * scale, stats
+
+
+def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, context):
     model.train()
     totals = {}
     start = time.perf_counter()
@@ -437,7 +602,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, rank=
     total_steps = len(loader)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    if rank == 0:
+    if context.rank == 0:
         model_config = (model.module if hasattr(model, "module") else model).config
         print(
             f"epoch={epoch} phase=train start batches={total_steps} "
@@ -453,7 +618,14 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, rank=
         use_amp = args.amp and device.type == "cuda"
         with torch.autocast(device_type=device.type, enabled=use_amp):
             losses = model(images, im_info, gt_boxes)
-            total_loss = sum(losses.values())
+            det_loss, odam_loss = split_detection_and_odam_losses(losses)
+            total_loss, dp_grad_stats = maybe_apply_dp_odam_gradient_gate(
+                det_loss,
+                odam_loss,
+                model,
+                args,
+                context,
+            )
         if not torch.isfinite(total_loss):
             raise RuntimeError(f"Non-finite loss at epoch={epoch} step={step}: {float(total_loss.detach())}")
         if use_amp:
@@ -471,6 +643,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, rank=
 
         for key, value in losses.items():
             totals[key] = totals.get(key, 0.0) + float(value.detach())
+        for key, value in dp_grad_stats.items():
+            totals[key] = totals.get(key, 0.0) + float(value)
         totals["loss_total"] = totals.get("loss_total", 0.0) + float(total_loss.detach())
 
         if should_log_step(step, total_steps, args) and device.type == "cuda":
@@ -479,10 +653,15 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, rank=
         batch_time = step_end - step_start
         previous_end = step_end
 
-        if should_log_step(step, total_steps, args) and rank == 0:
+        if should_log_step(step, total_steps, args) and context.rank == 0:
             avg = {key: value / step for key, value in totals.items()}
+            current_metrics = {
+                **{key: float(value.detach()) for key, value in losses.items()},
+                **dp_grad_stats,
+                "loss_total": float(total_loss.detach()),
+            }
             loss_text = " ".join(
-                f"{key}={float(losses.get(key, total_loss).detach()):.4f}/{value:.4f}"
+                f"{key}={float(current_metrics.get(key, 0.0)):.4f}/{value:.4f}"
                 for key, value in sorted(avg.items())
                 if key != "loss_total"
             )
@@ -502,7 +681,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, rank=
             )
 
     seconds = time.perf_counter() - start
-    if rank == 0:
+    if context.rank == 0:
         print(f"epoch={epoch} phase=train done elapsed={format_seconds(seconds)}", flush=True)
     return {key: value / max(1, len(loader)) for key, value in totals.items()} | {"seconds": seconds}
 
@@ -527,7 +706,8 @@ def validate_loss(model, loader, device, args, phase="valid"):
         step_start = time.perf_counter()
         images, im_info, gt_boxes, _ = move_batch(batch, device)
         losses = model(images, im_info, gt_boxes)
-        total_loss = sum(losses.values())
+        det_loss, odam_loss = split_detection_and_odam_losses(losses)
+        total_loss = det_loss + odam_loss
         for key, value in losses.items():
             totals[f"{phase}_{key}"] = totals.get(f"{phase}_{key}", 0.0) + float(value.detach())
         totals[f"{phase}_loss_total"] = totals.get(f"{phase}_loss_total", 0.0) + float(total_loss.detach())
@@ -933,6 +1113,87 @@ def parse_args():
         help="Exclude GT-appended ROIs from the ODAM auxiliary pair loss.",
     )
     parser.add_argument(
+        "--dp-odam",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable Detection-Preserving ODAM reliable mining and branch isolation.",
+    )
+    parser.add_argument("--dp-odam-min-iou", type=float, default=0.5)
+    parser.add_argument("--dp-odam-min-confidence", type=float, default=0.5)
+    parser.add_argument(
+        "--dp-odam-min-rois",
+        type=int,
+        default=2,
+        help="Disable ODAM loss for the batch/rank when fewer reliable ROIs remain.",
+    )
+    parser.add_argument(
+        "--dp-odam-topk-per-gt",
+        type=int,
+        default=2,
+        help="Maximum reliable ODAM proposals kept per assigned GT object.",
+    )
+    parser.add_argument(
+        "--dp-odam-max-rois-per-batch",
+        type=int,
+        default=32,
+        help="Global reliable ODAM ROI cap per batch/rank. Use <=0 for no cap.",
+    )
+    parser.add_argument(
+        "--dp-odam-adaptive-quality-weight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Scale ODAM loss by mean sqrt(IoU * class-confidence) of reliable ROIs.",
+    )
+    parser.add_argument(
+        "--dp-odam-negative-iou-threshold",
+        type=float,
+        default=0.1,
+        help="Keep different-object ODAM negative pairs only when predicted boxes overlap above this threshold. Use <0 to keep all.",
+    )
+    parser.add_argument(
+        "--dp-odam-exclude-self-pairs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Remove best-ROI self-pairs from the positive ODAM pair loss.",
+    )
+    parser.add_argument(
+        "--dp-odam-detach-localization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detach ODAM bbox/IoU inputs so auxiliary loss does not update box regression through pair selection.",
+    )
+    parser.add_argument(
+        "--dp-odam-roi-classifier-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Recompute ODAM heatmaps from detached ROI features so ODAM updates ROI classifier layers only.",
+    )
+    parser.add_argument(
+        "--dp-odam-recovery-epochs",
+        type=int,
+        default=0,
+        help="Disable ODAM loss for the final N epochs to recover detection/localization.",
+    )
+    parser.add_argument(
+        "--dp-odam-gradient-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Probe ROI-classifier gradients and drop ODAM loss when cosine is below --dp-odam-conflict-threshold.",
+    )
+    parser.add_argument("--dp-odam-conflict-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--dp-odam-adaptive-norm-cap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When gradient gate is enabled, further cap ODAM loss scale by ROI-classifier gradient norm ratio.",
+    )
+    parser.add_argument(
+        "--dp-odam-norm-ratio",
+        type=float,
+        default=0.1,
+        help="Maximum ODAM/detection gradient norm ratio used by --dp-odam-adaptive-norm-cap.",
+    )
+    parser.add_argument(
         "--sab-odam",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1032,6 +1293,22 @@ def main():
         raise ValueError("--odam-loss-warmup-epochs must be >= 0")
     if args.odam_smooth_kernel < 1:
         raise ValueError("--odam-smooth-kernel must be >= 1")
+    if not 0.0 <= args.dp_odam_min_iou <= 1.0:
+        raise ValueError("--dp-odam-min-iou must be in [0, 1]")
+    if not 0.0 <= args.dp_odam_min_confidence <= 1.0:
+        raise ValueError("--dp-odam-min-confidence must be in [0, 1]")
+    if args.dp_odam_min_rois < 1:
+        raise ValueError("--dp-odam-min-rois must be >= 1")
+    if args.dp_odam_topk_per_gt < 1:
+        raise ValueError("--dp-odam-topk-per-gt must be >= 1")
+    if args.dp_odam_negative_iou_threshold > 1.0:
+        raise ValueError("--dp-odam-negative-iou-threshold must be <= 1")
+    if args.dp_odam_recovery_epochs < 0:
+        raise ValueError("--dp-odam-recovery-epochs must be >= 0")
+    if args.dp_odam_recovery_epochs >= args.epochs:
+        raise ValueError("--dp-odam-recovery-epochs must be < --epochs")
+    if args.dp_odam_norm_ratio <= 0.0:
+        raise ValueError("--dp-odam-norm-ratio must be > 0")
     if args.sab_small_area_threshold <= 0.0:
         raise ValueError("--sab-small-area-threshold must be > 0")
     if args.sab_medium_area_threshold <= args.sab_small_area_threshold:
@@ -1220,7 +1497,7 @@ def main():
                 device,
                 epoch,
                 args,
-                rank=distributed.rank,
+                context=distributed,
             )
             train_metrics = reduce_metrics_mean(train_metrics, distributed)
 

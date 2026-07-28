@@ -154,6 +154,45 @@ class RCNN(nn.Module):
                 odam_masks = fg_masks
                 if getattr(config, "odam_exclude_gt_rois", True):
                     odam_masks = fg_masks & ~roi_is_gt
+                odam_pair_weights = None
+                odam_pair_quality = pred_cls.new_tensor(1.0)
+                odam_candidate_count = int(odam_masks.sum().detach().item())
+                odam_reliable_count = odam_candidate_count
+                if bool(getattr(config, "dp_odam", False)) and odam_masks.any():
+                    all_iou = pred_cls.new_zeros(labels.shape, dtype=pred_cls.dtype)
+                    all_iou[fg_masks] = pred_gt_ious.detach().to(dtype=pred_cls.dtype)
+                    cls_prob = F.softmax(pred_cls.detach(), dim=-1)
+                    row_ids = torch.arange(labels.numel(), device=labels.device)
+                    safe_labels = labels.clamp(min=0)
+                    all_conf = cls_prob[row_ids, safe_labels].to(dtype=pred_cls.dtype)
+                    reliability = (all_iou.clamp(min=0.0) * all_conf.clamp(min=0.0)).sqrt()
+                    reliable_masks = (
+                        odam_masks
+                        & (all_iou >= float(getattr(config, "dp_odam_min_iou", 0.5)))
+                        & (all_conf >= float(getattr(config, "dp_odam_min_confidence", 0.5)))
+                    )
+                    if reliable_masks.any():
+                        rel_inds = reliable_masks.nonzero(as_tuple=True)[0]
+                        keep_rel = select_reliable_odam_rois(
+                            assigned_gts[rel_inds],
+                            reliability[rel_inds],
+                            int(getattr(config, "dp_odam_topk_per_gt", 2)),
+                            int(getattr(config, "dp_odam_max_rois_per_batch", 32)),
+                        )
+                        selected = rel_inds[keep_rel]
+                        odam_masks = torch.zeros_like(odam_masks)
+                        odam_masks[selected] = True
+                        odam_pair_weights = reliability[selected]
+                        odam_reliable_count = int(selected.numel())
+                        if selected.numel() > 0:
+                            odam_pair_quality = odam_pair_weights.mean().detach().clamp(0.0, 1.0)
+                    else:
+                        odam_masks = torch.zeros_like(odam_masks)
+                        odam_reliable_count = 0
+                    if odam_reliable_count < int(getattr(config, "dp_odam_min_rois", 2)):
+                        odam_masks = torch.zeros_like(odam_masks)
+                        odam_pair_weights = None
+                        odam_pair_quality = pred_cls.new_tensor(0.0)
                 if odam_enabled and odam_masks.any():
                     odam_gt_classes = labels[odam_masks]
                     odam_delta = pred_delta[odam_masks, odam_gt_classes, :]
@@ -166,6 +205,7 @@ class RCNN(nn.Module):
                     assigned_gts_odam = assigned_gts[odam_masks]
                     bids = rcnn_rois[odam_masks, 0].long()
                     rois_odam = rcnn_rois[odam_masks, 1:5]
+                    sab_losses = {}
                     if self.sab_odam is not None:
                         sab_losses = self.sab_odam(
                             self,
@@ -182,10 +222,18 @@ class RCNN(nn.Module):
                         )
                         loss_rcnn_match = sab_losses.pop("loss_sab_match")
                     else:
-                        target_scores = F.softmax(pred_cls, dim=-1) if getattr(config, "odam_use_confidence_target", True) else pred_cls
+                        odam_pool_features = pool_features
+                        odam_pred_cls = pred_cls
+                        if bool(getattr(config, "dp_odam_roi_classifier_only", False)):
+                            odam_pool_features = pool_features.detach().requires_grad_(True)
+                            odam_flatten_feature = torch.flatten(odam_pool_features, start_dim=1)
+                            odam_flatten_feature = F.relu(self.fc1(odam_flatten_feature))
+                            odam_flatten_feature = F.relu(self.fc2(odam_flatten_feature))
+                            odam_pred_cls = self.pred_cls(odam_flatten_feature)
+                        target_scores = F.softmax(odam_pred_cls, dim=-1) if getattr(config, "odam_use_confidence_target", True) else odam_pred_cls
                         pool_grads = self.get_gradient(
                             target_scores,
-                            pool_features,
+                            odam_pool_features,
                             create_graph=getattr(config, "odam_create_graph", True),
                         ) # N, C-1, 256, 7,7
                         pool_grads = smooth_pool_grads(
@@ -194,7 +242,7 @@ class RCNN(nn.Module):
                         )
                         odam_inds = odam_masks.nonzero(as_tuple=True)[0]
                         pool_dams = F.relu((pool_grads[odam_inds, odam_gt_classes-1,:,:,:] *
-                            pool_features[odam_masks]).sum(1)) # Num_pred,7,7
+                            odam_pool_features[odam_masks]).sum(1)) # Num_pred,7,7
 
                         dam_size = fpn_fms[2].size()[-2:] # image_size // 16
                         level_assignments_odam = level_assignments[odam_masks]
@@ -206,16 +254,31 @@ class RCNN(nn.Module):
                             pred_dams,
                             assigned_gts_odam,
                             bids,
-                            odam_pred_bbox,
-                            odam_pred_gt_ious,
+                            odam_pred_bbox.detach() if bool(getattr(config, "dp_odam_detach_localization", False)) else odam_pred_bbox,
+                            odam_pred_gt_ious.detach() if bool(getattr(config, "dp_odam_detach_localization", False)) else odam_pred_gt_ious,
+                            pair_weights=odam_pair_weights,
+                            negative_iou_threshold=(
+                                float(getattr(config, "dp_odam_negative_iou_threshold", -1.0))
+                                if bool(getattr(config, "dp_odam", False))
+                                else None
+                            ),
+                            exclude_self_pairs=bool(getattr(config, "dp_odam_exclude_self_pairs", False)),
                         )
+                    if bool(getattr(config, "dp_odam_adaptive_quality_weight", False)):
+                        loss_rcnn_match = odam_pair_quality * loss_rcnn_match
                 else:
                     loss_rcnn_match = pred_delta_fg.sum() * 0.0
                     sab_losses = {}
+                    odam_pair_quality = pred_cls.new_tensor(0.0)
+                    odam_candidate_count = int(odam_masks.sum().detach().item()) if "odam_masks" in locals() else 0
+                    odam_reliable_count = 0
             else:
                 localization_loss = pred_delta.sum() * 0.0
                 loss_rcnn_match = pred_delta.sum() * 0.0
                 sab_losses = {}
+                odam_pair_quality = pred_cls.new_tensor(0.0)
+                odam_candidate_count = 0
+                odam_reliable_count = 0
 
             # loss for classification
             objectness_loss = softmax_loss(pred_cls, labels)
@@ -231,6 +294,12 @@ class RCNN(nn.Module):
             loss_dict['loss_rcnn_cls'] = loss_rcnn_cls
             loss_dict['loss_rcnn_match'] = loss_rcnn_match
             loss_dict.update(sab_losses)
+            if bool(getattr(config, "dp_odam", False)):
+                stat_zero = loss_rcnn_match.detach() * 0.0
+                loss_dict["stat_dp_odam_candidates"] = stat_zero + float(odam_candidate_count)
+                loss_dict["stat_dp_odam_reliable_rois"] = stat_zero + float(odam_reliable_count)
+                loss_dict["stat_dp_odam_pair_quality"] = odam_pair_quality.detach()
+                loss_dict["stat_dp_odam_gate_empty"] = stat_zero + (1.0 if odam_reliable_count == 0 else 0.0)
 
             return loss_dict
         else:
@@ -525,6 +594,26 @@ def select_sab_rois(assigned_gts, pred_gt_iou, topk_per_gt, max_rois):
     keep = torch.cat(selected, dim=0)
     if int(max_rois) > 0 and keep.numel() > int(max_rois):
         order = pred_gt_iou[keep].argsort(descending=True)
+        keep = keep[order[: int(max_rois)]]
+    return keep
+
+
+def select_reliable_odam_rois(assigned_gts, reliability, topk_per_gt, max_rois):
+    if assigned_gts.numel() == 0:
+        return assigned_gts.new_zeros((0,), dtype=torch.long)
+    selected = []
+    topk_per_gt = max(1, int(topk_per_gt))
+    for gt_id in assigned_gts.unique(sorted=True):
+        inds = torch.nonzero(assigned_gts == gt_id, as_tuple=False).flatten()
+        if inds.numel() == 0:
+            continue
+        order = reliability[inds].argsort(descending=True)
+        selected.append(inds[order[:topk_per_gt]])
+    if not selected:
+        return assigned_gts.new_zeros((0,), dtype=torch.long)
+    keep = torch.cat(selected, dim=0)
+    if int(max_rois) > 0 and keep.numel() > int(max_rois):
+        order = reliability[keep].argsort(descending=True)
         keep = keep[order[: int(max_rois)]]
     return keep
 
@@ -909,7 +998,16 @@ def roi_align_inv(pool_dams, rois, scale, map_size):
     dam_maps[ids, indices[ids, valid_inds]] = roi_dam_values[ids, valid_inds] # N, map_size
     return dam_maps.reshape(N, map_size[0], map_size[1])
 
-def match_loss(dams, objs, bids, pred_bbox, pred_gt_iou):
+def match_loss(
+    dams,
+    objs,
+    bids,
+    pred_bbox,
+    pred_gt_iou,
+    pair_weights=None,
+    negative_iou_threshold=None,
+    exclude_self_pairs=False,
+):
     M, C = dams.shape
     if M == 0:
         return dams.sum() * 0.0
@@ -932,6 +1030,14 @@ def match_loss(dams, objs, bids, pred_bbox, pred_gt_iou):
     same_object = best_objs[:, None] == objs[None, :]
     same_image = best_bids[:, None] == bids[None, :]
     different_object_same_image = same_image & ~same_object
+    if exclude_self_pairs:
+        candidate_positions = torch.arange(M, device=dams.device)
+        same_object = same_object & (best_positions[:, None] != candidate_positions[None, :])
+    if negative_iou_threshold is not None and float(negative_iou_threshold) >= 0.0:
+        overlaps = box_overlap_opr(pred_bbox[best_positions], pred_bbox)
+        different_object_same_image = different_object_same_image & (
+            overlaps > float(negative_iou_threshold)
+        )
 
     pos_sims = (best_dams[:, None, :] * dams[None, :, :]).sum(-1)[same_object]
     neg_sims = (best_dams[:, None, :] * dams[None, :, :]).sum(-1)[different_object_same_image]
@@ -941,5 +1047,20 @@ def match_loss(dams, objs, bids, pred_bbox, pred_gt_iou):
     pair_count = pos_sims.numel() + neg_sims.numel()
     if pair_count == 0:
         return dams.sum() * 0.0
-    loss = (-pos_sims.log().sum() - (1 - neg_sims).log().sum()) / pair_count
+    if pair_weights is None:
+        loss = (-pos_sims.log().sum() - (1 - neg_sims).log().sum()) / pair_count
+        return loss
+
+    pair_weights = pair_weights.to(dtype=dams.dtype, device=dams.device).clamp(min=0.0)
+    best_weights = pair_weights[best_positions]
+    pair_weight_matrix = (best_weights[:, None] * pair_weights[None, :]).sqrt()
+    pos_weights = pair_weight_matrix[same_object]
+    neg_weights = pair_weight_matrix[different_object_same_image]
+    denom = pos_weights.sum() + neg_weights.sum()
+    if float(denom.detach()) <= 0.0:
+        return dams.sum() * 0.0
+    loss = (
+        (-pos_sims.log() * pos_weights).sum()
+        - ((1 - neg_sims).log() * neg_weights).sum()
+    ) / denom.clamp(min=1e-8)
     return loss
