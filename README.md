@@ -206,7 +206,7 @@ torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
   --weight-decay 0.0005 \
   --step-size 8 \
   --gamma 0.1 \
-  --amp \
+  --no-amp \
   --include-empty-categories \
   --rpn-batch-size 256 \
   --rpn-fg-fraction 0.5 \
