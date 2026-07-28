@@ -271,7 +271,7 @@ def make_config(args, mapping):
         odam_create_graph=args.odam_create_graph,
         odam_use_confidence_target=args.odam_use_confidence_target,
         odam_exclude_gt_rois=args.odam_exclude_gt_rois,
-        dp_odam=args.dp_odam,
+        dp_odam=args.dp_odam or args.dpga_odam,
         dp_odam_min_iou=args.dp_odam_min_iou,
         dp_odam_min_confidence=args.dp_odam_min_confidence,
         dp_odam_min_rois=args.dp_odam_min_rois,
@@ -437,7 +437,7 @@ def compute_odam_loss_weight(epoch, args):
     if target_weight <= 0.0:
         return 0.0
     recovery_epochs = int(getattr(args, "dp_odam_recovery_epochs", 0))
-    if bool(getattr(args, "dp_odam", False)) and recovery_epochs > 0:
+    if (bool(getattr(args, "dp_odam", False)) or bool(getattr(args, "dpga_odam", False))) and recovery_epochs > 0:
         recovery_start = int(args.epochs) - recovery_epochs + 1
         if epoch >= recovery_start:
             return 0.0
@@ -623,6 +623,369 @@ def maybe_apply_dp_odam_gradient_gate(det_loss, odam_loss, model, args, context)
     return det_loss + odam_loss * scale, stats
 
 
+DPGA_MODULES = (
+    "backbone",
+    "fpn",
+    "rpn",
+    "roi_shared",
+    "roi_classifier",
+    "roi_regressor",
+)
+
+
+DPGA_DEFAULT_POLICIES = {
+    "backbone": {"enabled": True, "max_norm_ratio": 0.05, "reject_cosine": -0.05, "full_cosine": 0.20},
+    "fpn": {"enabled": True, "max_norm_ratio": 0.10, "reject_cosine": -0.05, "full_cosine": 0.15},
+    "rpn": {"enabled": False, "max_norm_ratio": 0.00, "reject_cosine": -0.05, "full_cosine": 0.15},
+    "roi_shared": {"enabled": True, "max_norm_ratio": 0.20, "reject_cosine": -0.10, "full_cosine": 0.10},
+    "roi_classifier": {"enabled": True, "max_norm_ratio": 0.20, "reject_cosine": -0.05, "full_cosine": 0.15},
+    "roi_regressor": {"enabled": True, "max_norm_ratio": 0.02, "reject_cosine": 0.00, "full_cosine": 0.20},
+}
+
+
+def dpga_parameter_module(name):
+    if name.startswith("module."):
+        name = name[len("module.") :]
+    if name.startswith("resnet50.body.fc."):
+        return "unused"
+    if name.startswith("resnet50."):
+        return "backbone"
+    if name.startswith("FPN."):
+        return "fpn"
+    if name.startswith("RPN."):
+        return "rpn"
+    if name.startswith("RCNN.fc1.") or name.startswith("RCNN.fc2."):
+        return "roi_shared"
+    if name.startswith("RCNN.pred_cls."):
+        return "roi_classifier"
+    if name.startswith("RCNN.pred_delta."):
+        return "roi_regressor"
+    return "other"
+
+
+def dpga_module_policies(args):
+    policies = {key: dict(value) for key, value in DPGA_DEFAULT_POLICIES.items()}
+    policies["backbone"]["max_norm_ratio"] = float(args.dpga_backbone_norm_ratio)
+    policies["fpn"]["max_norm_ratio"] = float(args.dpga_fpn_norm_ratio)
+    policies["rpn"]["max_norm_ratio"] = float(args.dpga_rpn_norm_ratio)
+    policies["roi_shared"]["max_norm_ratio"] = float(args.dpga_roi_shared_norm_ratio)
+    policies["roi_classifier"]["max_norm_ratio"] = float(args.dpga_roi_classifier_norm_ratio)
+    policies["roi_regressor"]["max_norm_ratio"] = float(args.dpga_roi_regressor_norm_ratio)
+
+    coverage = str(args.dpga_module_coverage)
+    if coverage == "roi-head-only":
+        for module_name in ("backbone", "fpn", "rpn", "roi_regressor"):
+            policies[module_name]["enabled"] = False
+    elif coverage == "roi-no-regressor":
+        for module_name in ("backbone", "fpn", "rpn", "roi_regressor"):
+            policies[module_name]["enabled"] = False
+        policies["roi_shared"]["enabled"] = True
+        policies["roi_classifier"]["enabled"] = True
+    elif coverage == "global":
+        for module_name in DPGA_MODULES:
+            policies[module_name]["enabled"] = module_name != "rpn"
+            policies[module_name]["max_norm_ratio"] = float(args.dpga_global_norm_ratio)
+
+    if not bool(args.dpga_projection):
+        for policy in policies.values():
+            policy["project_on_negative"] = False
+    else:
+        for policy in policies.values():
+            policy["project_on_negative"] = True
+    return policies
+
+
+def dpga_trainable_named_parameters(model):
+    module = model.module if hasattr(model, "module") else model
+    named_params = []
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if dpga_parameter_module(name) == "unused":
+            continue
+        named_params.append((name, param))
+    return named_params
+
+
+def dpga_piecewise_gate(cosine, reject_threshold, full_threshold):
+    if full_threshold <= reject_threshold:
+        return torch.where(cosine >= full_threshold, torch.ones_like(cosine), torch.zeros_like(cosine))
+    gate = (cosine - float(reject_threshold)) / float(full_threshold - reject_threshold)
+    return gate.clamp(0.0, 1.0)
+
+
+def compose_dpga_module_gradients(det_grads, odam_grads, policy, eps=1e-12):
+    device = det_grads[0].device
+    dtype = torch.float32
+    dot = torch.zeros((), device=device, dtype=dtype)
+    det_sq = torch.zeros((), device=device, dtype=dtype)
+    odam_sq = torch.zeros((), device=device, dtype=dtype)
+    for det_grad, odam_grad in zip(det_grads, odam_grads):
+        det_flat = det_grad.detach().float().reshape(-1)
+        odam_flat = odam_grad.detach().float().reshape(-1)
+        dot = dot + (det_flat * odam_flat).sum()
+        det_sq = det_sq + det_flat.pow(2).sum()
+        odam_sq = odam_sq + odam_flat.pow(2).sum()
+
+    det_norm = det_sq.sqrt()
+    odam_norm = odam_sq.sqrt()
+    finite = torch.isfinite(dot) & torch.isfinite(det_norm) & torch.isfinite(odam_norm)
+    if (not bool(finite.detach().item())) or float(det_norm.detach()) <= eps or float(odam_norm.detach()) <= eps:
+        return [torch.zeros_like(grad) for grad in odam_grads], {
+            "valid": 0.0,
+            "cosine": 0.0,
+            "norm_ratio": 0.0,
+            "gate": 0.0,
+            "norm_scale": 0.0,
+            "effective_scale": 0.0,
+            "projected": 0.0,
+            "rejected": 1.0,
+        }
+
+    cosine = dot / (det_norm * odam_norm + eps)
+    projected = bool(policy.get("project_on_negative", True)) and float(cosine.detach()) < 0.0
+    safe_odam_grads = []
+    if projected:
+        coeff = dot / (det_sq + eps)
+        for det_grad, odam_grad in zip(det_grads, odam_grads):
+            safe_odam_grads.append(odam_grad - coeff.to(dtype=odam_grad.dtype) * det_grad)
+    else:
+        safe_odam_grads = list(odam_grads)
+
+    safe_sq = torch.zeros((), device=device, dtype=dtype)
+    for grad in safe_odam_grads:
+        safe_sq = safe_sq + grad.detach().float().pow(2).sum()
+    safe_norm = safe_sq.sqrt()
+
+    max_ratio = float(policy.get("max_norm_ratio", 0.0))
+    if max_ratio <= 0.0:
+        norm_scale = torch.zeros((), device=device, dtype=dtype)
+    else:
+        norm_scale = torch.clamp(max_ratio * det_norm / (safe_norm + eps), max=1.0)
+    gate = dpga_piecewise_gate(
+        cosine,
+        float(policy.get("reject_cosine", -0.05)),
+        float(policy.get("full_cosine", 0.15)),
+    )
+    effective_scale = gate * norm_scale
+    final_odam = [effective_scale.to(dtype=grad.dtype) * grad for grad in safe_odam_grads]
+    return final_odam, {
+        "valid": 1.0,
+        "cosine": float(cosine.detach()),
+        "norm_ratio": float((odam_norm / (det_norm + eps)).detach()),
+        "gate": float(gate.detach()),
+        "norm_scale": float(norm_scale.detach()),
+        "effective_scale": float(effective_scale.detach()),
+        "projected": 1.0 if projected else 0.0,
+        "rejected": 1.0 if float(effective_scale.detach()) <= 0.0 else 0.0,
+    }
+
+
+def sync_dpga_active(active, context):
+    if not context.enabled:
+        return bool(active.detach().item())
+    value = active.clone()
+    dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    return bool((value > 0).detach().item())
+
+
+def sync_dpga_stats(local_stats, context):
+    if not context.enabled:
+        return local_stats
+
+    fields = ("valid", "cosine", "norm_ratio", "gate", "norm_scale", "effective_scale", "projected", "rejected")
+    values = []
+    for module_name in DPGA_MODULES:
+        stats = local_stats["modules"].get(module_name, {})
+        valid = float(stats.get("valid", 0.0))
+        values.append(valid)
+        for field in fields[1:]:
+            values.append(float(stats.get(field, 0.0)) * valid)
+    values.extend(
+        [
+            float(local_stats.get("any_active", 0.0)),
+            float(local_stats.get("detection_only_fallback", 0.0)),
+            float(local_stats.get("final_grad_norm", 0.0)),
+        ]
+    )
+    tensor = torch.tensor(values, device=local_stats["device"], dtype=torch.float32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    synced = {"modules": {}, "device": local_stats["device"]}
+    idx = 0
+    for module_name in DPGA_MODULES:
+        count = float(tensor[idx].detach())
+        idx += 1
+        module_stats = {"valid": count}
+        denom = max(count, 1.0)
+        for field in fields[1:]:
+            module_stats[field] = float(tensor[idx].detach()) / denom
+            idx += 1
+        synced["modules"][module_name] = module_stats
+    world_size = max(1, int(context.world_size))
+    synced["any_active"] = float(tensor[idx].detach()) / world_size
+    synced["detection_only_fallback"] = float(tensor[idx + 1].detach()) / world_size
+    synced["final_grad_norm"] = float(tensor[idx + 2].detach()) / world_size
+    return synced
+
+
+def flatten_dpga_stats(synced_stats):
+    output = {
+        "stat_dpga_any_active": float(synced_stats.get("any_active", 0.0)),
+        "stat_dpga_detection_only_fallback": float(synced_stats.get("detection_only_fallback", 0.0)),
+        "stat_dpga_final_grad_norm": float(synced_stats.get("final_grad_norm", 0.0)),
+    }
+    valid_modules = 0
+    totals = {"cosine": 0.0, "norm_ratio": 0.0, "gate": 0.0, "norm_scale": 0.0, "effective_scale": 0.0, "projected": 0.0, "rejected": 0.0}
+    for module_name in DPGA_MODULES:
+        stats = synced_stats.get("modules", {}).get(module_name, {})
+        valid = float(stats.get("valid", 0.0))
+        prefix = f"stat_dpga_{module_name}"
+        output[f"{prefix}_valid"] = 1.0 if valid > 0.0 else 0.0
+        for field in totals:
+            value = float(stats.get(field, 0.0))
+            output[f"{prefix}_{field}"] = value
+            if valid > 0.0:
+                totals[field] += value
+        if valid > 0.0:
+            valid_modules += 1
+    denom = max(1, valid_modules)
+    for field, value in totals.items():
+        output[f"stat_dpga_mean_{field}"] = value / denom
+    return output
+
+
+def assign_and_sync_final_gradients(named_params, final_grads, context):
+    grad_sq = None
+    for (_, param), grad in zip(named_params, final_grads):
+        if grad is None:
+            param.grad = None
+            continue
+        if not torch.isfinite(grad).all():
+            raise FloatingPointError("Non-finite DPGA-ODAM final gradient")
+        param.grad = grad.detach().clone()
+        current_sq = param.grad.float().pow(2).sum()
+        grad_sq = current_sq if grad_sq is None else grad_sq + current_sq
+
+    if context.enabled:
+        flat_grads = [param.grad.reshape(-1) for _, param in named_params if param.grad is not None]
+        if flat_grads:
+            flat = torch.cat(flat_grads)
+            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+            flat = flat / float(context.world_size)
+            offset = 0
+            for _, param in named_params:
+                if param.grad is None:
+                    continue
+                numel = param.numel()
+                param.grad.copy_(flat[offset : offset + numel].view_as(param))
+                offset += numel
+
+    if grad_sq is None:
+        return 0.0
+    return float(grad_sq.sqrt().detach())
+
+
+def compose_dpga_odam_gradients(det_loss, odam_loss, model, args, context):
+    if not bool(torch.isfinite(det_loss).detach().item()):
+        raise RuntimeError(f"Non-finite detection loss: {float(det_loss.detach())}")
+
+    named_params = dpga_trainable_named_parameters(model)
+    if not named_params:
+        raise RuntimeError("DPGA-ODAM found no trainable parameters")
+    params = [param for _, param in named_params]
+    module_names = [dpga_parameter_module(name) for name, _ in named_params]
+    policies = dpga_module_policies(args)
+
+    local_active = torch.tensor(
+        1.0 if bool(torch.isfinite(odam_loss).detach().item()) and float(odam_loss.detach()) != 0.0 else 0.0,
+        device=det_loss.device,
+        dtype=torch.float32,
+    )
+    any_active = sync_dpga_active(local_active, context)
+    det_grads = torch.autograd.grad(
+        det_loss,
+        params,
+        retain_graph=any_active and bool(local_active.detach().item()),
+        allow_unused=True,
+    )
+    missing_detection = [name for (name, _), grad in zip(named_params, det_grads) if grad is None]
+    if missing_detection and bool(args.dpga_fail_on_missing_detection_grad):
+        preview = ", ".join(missing_detection[:5])
+        raise RuntimeError(f"Missing detection gradient for DPGA parameter(s): {preview}")
+
+    if bool(local_active.detach().item()):
+        odam_grads = torch.autograd.grad(
+            odam_loss,
+            params,
+            retain_graph=False,
+            allow_unused=True,
+        )
+    else:
+        odam_grads = tuple(None for _ in params)
+
+    grouped_indices = {module_name: [] for module_name in DPGA_MODULES}
+    for idx, module_name in enumerate(module_names):
+        if module_name in grouped_indices:
+            grouped_indices[module_name].append(idx)
+
+    final_grads = []
+    for det_grad in det_grads:
+        if det_grad is None:
+            final_grads.append(None)
+        else:
+            final_grads.append(det_grad.detach().clone())
+
+    local_stats = {
+        "modules": {},
+        "device": det_loss.device,
+        "any_active": 1.0 if any_active else 0.0,
+        "detection_only_fallback": 0.0 if any_active else 1.0,
+        "final_grad_norm": 0.0,
+    }
+
+    for module_name in DPGA_MODULES:
+        policy = policies[module_name]
+        indices = grouped_indices[module_name]
+        det_group = []
+        odam_group = []
+        valid_indices = []
+        for idx in indices:
+            det_grad = det_grads[idx]
+            odam_grad = odam_grads[idx]
+            if det_grad is None:
+                continue
+            if (
+                not any_active
+                or not bool(policy.get("enabled", True))
+                or odam_grad is None
+                or float(policy.get("max_norm_ratio", 0.0)) <= 0.0
+            ):
+                continue
+            det_group.append(det_grad)
+            odam_group.append(odam_grad)
+            valid_indices.append(idx)
+
+        if not valid_indices:
+            local_stats["modules"][module_name] = {"valid": 0.0}
+            continue
+
+        safe_odam_grads, module_stats = compose_dpga_module_gradients(det_group, odam_group, policy)
+        local_stats["modules"][module_name] = module_stats
+        for idx, safe_grad in zip(valid_indices, safe_odam_grads):
+            if final_grads[idx] is None:
+                continue
+            final_grads[idx] = final_grads[idx] + safe_grad.to(dtype=final_grads[idx].dtype)
+
+    final_grad_norm = assign_and_sync_final_gradients(named_params, final_grads, context)
+    local_stats["final_grad_norm"] = final_grad_norm
+    synced_stats = sync_dpga_stats(local_stats, context)
+    stats = flatten_dpga_stats(synced_stats)
+    stats["stat_dpga_missing_detection_grad"] = float(len(missing_detection))
+    stats["stat_dpga_amp_disabled"] = 1.0 if args.amp else 0.0
+    total_loss = det_loss + (odam_loss if bool(local_active.detach().item()) else det_loss.detach() * 0.0)
+    return total_loss, stats
+
+
 def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, context):
     model.train()
     totals = {}
@@ -633,9 +996,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, conte
         torch.cuda.reset_peak_memory_stats(device)
     if context.rank == 0:
         model_config = (model.module if hasattr(model, "module") else model).config
+        use_amp = args.amp and device.type == "cuda" and not bool(getattr(args, "dpga_odam", False))
         print(
             f"epoch={epoch} phase=train start batches={total_steps} "
-            f"batch_size={loader.batch_size} amp={args.amp and device.type == 'cuda'} "
+            f"batch_size={loader.batch_size} amp={use_amp} "
             f"odam_loss_weight_effective={getattr(model_config, 'odam_loss_weight_effective', None)}",
             flush=True,
         )
@@ -644,20 +1008,36 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, conte
         data_time = step_start - previous_end
         images, im_info, gt_boxes, _ = move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        use_amp = args.amp and device.type == "cuda"
+        use_amp = args.amp and device.type == "cuda" and not bool(getattr(args, "dpga_odam", False))
         with torch.autocast(device_type=device.type, enabled=use_amp):
             losses = model(images, im_info, gt_boxes)
             det_loss, odam_loss = split_detection_and_odam_losses(losses)
-            total_loss, dp_grad_stats = maybe_apply_dp_odam_gradient_gate(
-                det_loss,
-                odam_loss,
-                model,
-                args,
-                context,
-            )
+            if bool(getattr(args, "dpga_odam", False)):
+                total_loss, dp_grad_stats = compose_dpga_odam_gradients(
+                    det_loss,
+                    odam_loss,
+                    model,
+                    args,
+                    context,
+                )
+            else:
+                total_loss, dp_grad_stats = maybe_apply_dp_odam_gradient_gate(
+                    det_loss,
+                    odam_loss,
+                    model,
+                    args,
+                    context,
+                )
         if not torch.isfinite(total_loss):
             raise RuntimeError(f"Non-finite loss at epoch={epoch} step={step}: {float(total_loss.detach())}")
-        if use_amp:
+        if bool(getattr(args, "dpga_odam", False)):
+            if args.max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    [param for param in model.parameters() if param.grad is not None],
+                    args.max_grad_norm,
+                )
+            optimizer.step()
+        elif use_amp:
             scaler.scale(total_loss).backward()
             if args.max_grad_norm is not None:
                 scaler.unscale_(optimizer)
@@ -1223,6 +1603,41 @@ def parse_args():
         help="Maximum ODAM/detection gradient norm ratio used by --dp-odam-adaptive-norm-cap.",
     )
     parser.add_argument(
+        "--dpga-odam",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable Detection-Priority Gradient-Aligned ODAM. This uses the ODAM/DP-ODAM "
+            "auxiliary loss but composes detection and ODAM gradients with module-wise "
+            "projection, adaptive gate, norm balancing, and manual DDP all-reduce."
+        ),
+    )
+    parser.add_argument(
+        "--dpga-module-coverage",
+        choices=("full", "roi-head-only", "roi-no-regressor", "global"),
+        default="full",
+        help="Module coverage for DPGA gradient composition.",
+    )
+    parser.add_argument(
+        "--dpga-projection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Project away the ODAM component that points against detection when module cosine is negative.",
+    )
+    parser.add_argument("--dpga-global-norm-ratio", type=float, default=0.1)
+    parser.add_argument("--dpga-backbone-norm-ratio", type=float, default=0.05)
+    parser.add_argument("--dpga-fpn-norm-ratio", type=float, default=0.10)
+    parser.add_argument("--dpga-rpn-norm-ratio", type=float, default=0.00)
+    parser.add_argument("--dpga-roi-shared-norm-ratio", type=float, default=0.20)
+    parser.add_argument("--dpga-roi-classifier-norm-ratio", type=float, default=0.20)
+    parser.add_argument("--dpga-roi-regressor-norm-ratio", type=float, default=0.02)
+    parser.add_argument(
+        "--dpga-fail-on-missing-detection-grad",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail closed if an included trainable parameter has no detection gradient.",
+    )
+    parser.add_argument(
         "--sab-odam",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1338,6 +1753,17 @@ def main():
         raise ValueError("--dp-odam-recovery-epochs must be < --epochs")
     if args.dp_odam_norm_ratio <= 0.0:
         raise ValueError("--dp-odam-norm-ratio must be > 0")
+    for name in (
+        "dpga_global_norm_ratio",
+        "dpga_backbone_norm_ratio",
+        "dpga_fpn_norm_ratio",
+        "dpga_rpn_norm_ratio",
+        "dpga_roi_shared_norm_ratio",
+        "dpga_roi_classifier_norm_ratio",
+        "dpga_roi_regressor_norm_ratio",
+    ):
+        if getattr(args, name) < 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
     if args.sab_small_area_threshold <= 0.0:
         raise ValueError("--sab-small-area-threshold must be > 0")
     if args.sab_medium_area_threshold <= args.sab_small_area_threshold:
@@ -1431,7 +1857,9 @@ def main():
             )
 
         train_model = raw_model
-        if distributed.enabled:
+        if distributed.enabled and bool(args.dpga_odam) and distributed.is_main:
+            print("DPGA-ODAM uses manual distributed gradient all-reduce; DDP wrapper disabled.", flush=True)
+        if distributed.enabled and not bool(args.dpga_odam):
             train_model = DistributedDataParallel(
                 raw_model,
                 device_ids=[distributed.local_rank],

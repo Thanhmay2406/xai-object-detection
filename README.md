@@ -179,6 +179,61 @@ For a lower-overhead first run, drop `--dp-odam-gradient-gate` and
 `--dp-odam-adaptive-norm-cap`; reliable mining, pair-quality weighting, branch
 isolation, and recovery phase remain active.
 
+### Run DPGA-ODAM
+
+`DPGA-ODAM` implements the gradient-aligned training idea from
+`gradient_aligned_odam_architecture.md`. It reuses the ODAM/DP-ODAM auxiliary
+loss, but does not backpropagate `L_det + L_ODAM` directly. Instead it computes
+detection and ODAM gradients separately, applies detection-priority projection,
+module-wise norm balancing, adaptive gates, and manual distributed gradient
+all-reduce. When `--dpga-odam` is enabled, AMP is disabled for the training step
+because gradients are composed manually.
+
+Conservative two-GPU Kaggle/T4x2 run:
+
+```bash
+torchrun --standalone --nproc_per_node=2 rcnn_odamTrain/train.py \
+  --data-root /kaggle/input/datasets/thanhmay2406/dataset-for-research/drill_bit_coco \
+  --output-dir /kaggle/working/results/dpga_odam_train \
+  --overwrite \
+  --backbone-weights default \
+  --epochs 30 \
+  --batch-size 4 \
+  --workers 2 \
+  --image-size 640 \
+  --lr 0.0025 \
+  --momentum 0.9 \
+  --weight-decay 0.0005 \
+  --step-size 8 \
+  --gamma 0.1 \
+  --amp \
+  --include-empty-categories \
+  --rpn-batch-size 256 \
+  --rpn-fg-fraction 0.5 \
+  --odam-nms \
+  --odam-nms-low-threshold 0.2 \
+  --odam-nms-high-threshold 0.8 \
+  --odam-nms-resize-short-edge 50 \
+  --odam-loss-start-epoch 10 \
+  --odam-loss-warmup-epochs 5 \
+  --dpga-odam \
+  --dpga-module-coverage roi-head-only \
+  --dpga-roi-shared-norm-ratio 0.2 \
+  --dpga-roi-classifier-norm-ratio 0.2 \
+  --dp-odam-min-iou 0.5 \
+  --dp-odam-min-confidence 0.5 \
+  --dp-odam-topk-per-gt 2 \
+  --dp-odam-max-rois-per-batch 32 \
+  --dp-odam-negative-iou-threshold 0.1 \
+  --dp-odam-recovery-epochs 5 \
+  --test-after-train \
+  --test-checkpoint best
+```
+
+Use `--dpga-module-coverage full` only after the ROI-head run is stable. The
+full policy enables backbone/FPN/ROI shared/classifier/regressor alignment while
+keeping RPN protected by default.
+
 ### Run SAB-ODAM Improved Architecture
 
 `SAB-ODAM` implements the training-time improvement described in
