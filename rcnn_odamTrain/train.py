@@ -537,15 +537,28 @@ def gradient_alignment_stats(det_loss, odam_loss, parameters):
     return cosine, det_norm, odam_norm, finite.to(dtype=dtype)
 
 
-def sync_dp_odam_stats(cosine, det_norm, odam_norm, finite, context):
+def sync_dp_odam_stats(cosine, det_norm, odam_norm, finite, active, context):
     if not context.enabled:
-        return cosine, det_norm, odam_norm, bool(finite.detach().item())
-    values = torch.stack((cosine, det_norm, odam_norm))
+        return cosine, det_norm, odam_norm, bool(finite.detach().item()), bool(active.detach().item())
+
+    weighted_finite = finite * active
+    values = torch.stack(
+        (
+            cosine * active,
+            det_norm * active,
+            odam_norm * active,
+            active,
+            weighted_finite,
+        )
+    )
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
-    values = values / float(context.world_size)
-    finite_min = finite.clone()
-    dist.all_reduce(finite_min, op=dist.ReduceOp.MIN)
-    return values[0], values[1], values[2], bool(finite_min.detach().item())
+    active_count = values[3].clamp(min=1.0)
+    cosine = values[0] / active_count
+    det_norm = values[1] / active_count
+    odam_norm = values[2] / active_count
+    any_active = bool((values[3] > 0).detach().item())
+    finite_bool = any_active and bool((values[4] == values[3]).detach().item())
+    return cosine, det_norm, odam_norm, finite_bool, any_active
 
 
 def maybe_apply_dp_odam_gradient_gate(det_loss, odam_loss, model, args, context):
@@ -559,27 +572,43 @@ def maybe_apply_dp_odam_gradient_gate(det_loss, odam_loss, model, args, context)
     if (
         not bool(getattr(args, "dp_odam_gradient_gate", False))
         or not bool(getattr(args, "dp_odam", False))
-        or float(odam_loss.detach()) == 0.0
     ):
         return det_loss + odam_loss, stats
 
+    device = det_loss.device
+    dtype = torch.float32
+    active = torch.tensor(
+        1.0 if float(odam_loss.detach()) != 0.0 else 0.0,
+        device=device,
+        dtype=dtype,
+    )
     parameters = dp_odam_probe_parameters(model)
     if not parameters:
         stats["stat_dp_odam_grad_gate"] = 1.0
         stats["stat_dp_odam_grad_scale"] = 0.0
         return det_loss, stats
 
-    cosine, det_norm, odam_norm, finite = gradient_alignment_stats(det_loss, odam_loss, parameters)
-    cosine, det_norm, odam_norm, finite_bool = sync_dp_odam_stats(
+    if bool(active.detach().item()):
+        cosine, det_norm, odam_norm, finite = gradient_alignment_stats(det_loss, odam_loss, parameters)
+    else:
+        cosine = torch.zeros((), device=device, dtype=dtype)
+        det_norm = torch.zeros((), device=device, dtype=dtype)
+        odam_norm = torch.zeros((), device=device, dtype=dtype)
+        finite = torch.zeros((), device=device, dtype=dtype)
+    cosine, det_norm, odam_norm, finite_bool, any_active = sync_dp_odam_stats(
         cosine,
         det_norm,
         odam_norm,
         finite,
+        active,
         context,
     )
     stats["stat_dp_odam_grad_cosine"] = float(cosine.detach())
     stats["stat_dp_odam_det_grad_norm"] = float(det_norm.detach())
     stats["stat_dp_odam_odam_grad_norm"] = float(odam_norm.detach())
+
+    if not any_active:
+        return det_loss + odam_loss, stats
 
     if (not finite_bool) or float(cosine.detach()) < float(args.dp_odam_conflict_threshold):
         stats["stat_dp_odam_grad_gate"] = 1.0
