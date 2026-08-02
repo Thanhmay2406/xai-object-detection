@@ -1397,7 +1397,7 @@ def evaluate_coco(model, loader, device, mapping, split, score_threshold, log_ev
     return metrics
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Train rcnn_odamTrain Network on data/drill_bit_coco")
     parser.add_argument("--data-root", default="data/drill_bit_coco")
     parser.add_argument("--output-dir", default="results/rcnn_odam_train")
@@ -1698,11 +1698,11 @@ def parse_args():
     )
     parser.add_argument("--rcnn-batch-size", type=int, default=128)
     parser.add_argument("--rpn-anchor-sizes", type=int, nargs="+", default=[256, 128, 64, 32, 16])
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     if args.epochs < 1:
         raise ValueError("--epochs must be >= 1")
     if args.batch_size < 1:
