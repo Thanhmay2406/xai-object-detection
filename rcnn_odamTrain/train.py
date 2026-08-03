@@ -1147,6 +1147,8 @@ def validate_loss(model, loader, device, args, phase="valid"):
 def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, mapping, config, args):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
+    best_metric = getattr(args, "best_metric", None)
+    best_score = getattr(args, "best_score", None)
     torch.save(
         {
             "epoch": epoch,
@@ -1157,19 +1159,24 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, mapping, c
             "mapping": asdict(mapping),
             "config": asdict(config),
             "args": vars(args),
+            "best_metric": best_metric,
+            "best_score": best_score,
         },
         tmp_path,
     )
     tmp_path.replace(path)
 
 
-def restore_checkpoint(path, model, optimizer, scheduler, scaler, device):
+def restore_checkpoint(path, model, optimizer, scheduler, scaler, device, best_metric=None):
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     scaler.load_state_dict(checkpoint.get("scaler", {}))
-    return int(checkpoint["epoch"]) + 1
+    best_score = checkpoint.get("best_score")
+    if best_score is None and best_metric is not None:
+        best_score = checkpoint.get("metrics", {}).get(best_metric, -math.inf)
+    return int(checkpoint["epoch"]) + 1, float(best_score if best_score is not None else -math.inf)
 
 
 def load_model_checkpoint_for_eval(path, model, device):
@@ -1271,6 +1278,30 @@ def sanitize_metric_name(name):
     while "__" in cleaned:
         cleaned = cleaned.replace("__", "_")
     return cleaned.strip("_") or "class"
+
+
+BEST_METRIC_ALIASES = {
+    "map_50_95": "val_map_50_95",
+    "val_map_50_95": "val_map_50_95",
+    "map50": "val_map50",
+    "val_map50": "val_map50",
+    "map75": "val_map75",
+    "val_map75": "val_map75",
+    "ar_100": "val_ar_100",
+    "val_ar_100": "val_ar_100",
+}
+
+
+def normalize_best_metric(metric):
+    normalized = BEST_METRIC_ALIASES.get(metric)
+    if normalized is None:
+        allowed = ", ".join(sorted(BEST_METRIC_ALIASES))
+        raise ValueError(f"--best-metric must be one of: {allowed}")
+    return normalized
+
+
+def best_metric_score(row, metric):
+    return float(row.get(metric, -math.inf))
 
 
 def evaluate_coco(model, loader, device, mapping, split, score_threshold, log_every, log_first_n):
@@ -1438,6 +1469,15 @@ def parse_args(argv=None):
     parser.add_argument("--val-batches", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--log-first-n", type=int, default=3)
+    parser.add_argument(
+        "--best-metric",
+        default="val_map_50_95",
+        choices=tuple(sorted(BEST_METRIC_ALIASES)),
+        help=(
+            "Validation metric used to select best.pt. "
+            "Default val_map_50_95 follows standard COCO mAP."
+        ),
+    )
     parser.add_argument("--test-after-train", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--test-split", default="test")
     parser.add_argument("--test-checkpoint", choices=("best", "last"), default="best")
@@ -1703,6 +1743,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    args.best_metric = normalize_best_metric(args.best_metric)
     if args.epochs < 1:
         raise ValueError("--epochs must be >= 1")
     if args.batch_size < 1:
@@ -1846,14 +1887,16 @@ def main(argv=None):
         scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
 
         start_epoch = 1
+        best_score = -math.inf
         if args.resume is not None:
-            start_epoch = restore_checkpoint(
+            start_epoch, best_score = restore_checkpoint(
                 Path(args.resume),
                 raw_model,
                 optimizer,
                 scheduler,
                 scaler,
                 device,
+                best_metric=args.best_metric,
             )
 
         train_model = raw_model
@@ -1932,7 +1975,6 @@ def main(argv=None):
                 flush=True,
             )
 
-        best_map50 = -math.inf
         for epoch in range(start_epoch, args.epochs + 1):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -1993,6 +2035,11 @@ def main(argv=None):
             }
             if distributed.is_main:
                 write_epoch_metrics(output_dir / "metrics.csv", row)
+                current_score = best_metric_score(row, args.best_metric)
+                is_best = current_score > best_score
+                if is_best:
+                    best_score = current_score
+                args.best_score = best_score
                 save_checkpoint(
                     output_dir / "last.pt",
                     raw_model,
@@ -2004,10 +2051,7 @@ def main(argv=None):
                     config,
                     args,
                 )
-                current_map50 = float(row.get("val_map50", -math.inf))
-                is_best = current_map50 > best_map50
                 if is_best:
-                    best_map50 = current_map50
                     save_checkpoint(
                         output_dir / "best.pt",
                         raw_model,
@@ -2026,7 +2070,8 @@ def main(argv=None):
                 )
                 print(
                     f"epoch_summary {summary_text} "
-                    f"best_map50={best_map50:.4f}",
+                    f"best_metric={args.best_metric} "
+                    f"best_score={best_score:.4f}",
                     flush=True,
                 )
             distributed_barrier(distributed)

@@ -948,6 +948,37 @@ def sanitize_metric_name(name: str) -> str:
     return "_".join(parts) or "unnamed"
 
 
+BEST_METRIC_ALIASES = {
+    "map_50_95": "map_50_95",
+    "val_map_50_95": "map_50_95",
+    "map50": "map50",
+    "val_map50": "map50",
+    "map75": "map75",
+    "val_map75": "map75",
+    "ar_100": "ar_100",
+    "val_ar_100": "ar_100",
+}
+
+
+def normalize_best_metric(metric: str) -> str:
+    normalized = BEST_METRIC_ALIASES.get(metric)
+    if normalized is None:
+        allowed = ", ".join(sorted(BEST_METRIC_ALIASES))
+        raise ValueError(f"--best-metric must be one of: {allowed}")
+    return normalized
+
+
+def format_best_metric(metric: str) -> str:
+    return f"val_{metric}"
+
+
+def best_metric_score(metrics: dict[str, Any], metric: str) -> float:
+    value = metrics.get(metric)
+    if value is None:
+        raise KeyError(f"Best metric not available in validation metrics: {metric}")
+    return float(value)
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -957,7 +988,8 @@ def save_checkpoint(
     epoch: int,
     metrics: dict[str, Any],
     mapping: CategoryMapping,
-    best_map50: float,
+    best_metric: str,
+    best_score: float,
     args: argparse.Namespace,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -969,7 +1001,13 @@ def save_checkpoint(
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
         "metrics": metrics,
-        "best_map50": best_map50,
+        "best_metric": best_metric,
+        "best_score": best_score,
+        "best_map50": (
+            best_score
+            if best_metric == "map50"
+            else float(metrics.get("val_map50", -math.inf))
+        ),
         "mapping": asdict(mapping),
         "args": vars(args),
         "python_rng_state": random.getstate(),
@@ -995,6 +1033,7 @@ def restore_checkpoint(
     scaler: Any,
     mapping: CategoryMapping,
     device: torch.device,
+    best_metric: str,
 ) -> tuple[int, float]:
     checkpoint = torch.load(
         path,
@@ -1031,17 +1070,27 @@ def restore_checkpoint(
         torch.cuda.set_rng_state_all(cuda_rng_state_all)
 
     completed_epoch = int(checkpoint["epoch"])
-    best_map50 = float(checkpoint.get("best_map50", -math.inf))
+    best_score = checkpoint.get("best_score")
+    if best_score is None:
+        if best_metric == "map50":
+            best_score = checkpoint.get("best_map50", -math.inf)
+        else:
+            best_score = checkpoint.get("metrics", {}).get(
+                format_best_metric(best_metric),
+                -math.inf,
+            )
+    best_score = float(best_score)
 
     print(
         f"resume loaded={path} "
         f"completed_epoch={completed_epoch} "
         f"next_epoch={completed_epoch + 1} "
-        f"best_map50={best_map50:.6f}",
+        f"best_metric={format_best_metric(best_metric)} "
+        f"best_score={best_score:.6f}",
         flush=True,
     )
 
-    return completed_epoch + 1, best_map50
+    return completed_epoch + 1, best_score
 
 
 def load_model_checkpoint_for_eval(
@@ -1188,7 +1237,7 @@ def resolve_device(device_argument: str) -> torch.device:
     return device
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train Faster R-CNN on a COCO-format dataset"
     )
@@ -1249,6 +1298,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--log-first-n", type=int, default=3)
     parser.add_argument("--eval-log-every", type=int, default=50)
+    parser.add_argument(
+        "--best-metric",
+        default="val_map_50_95",
+        choices=tuple(sorted(BEST_METRIC_ALIASES)),
+        help=(
+            "Validation metric used to select best.pt. "
+            "Default val_map_50_95 follows standard COCO mAP."
+        ),
+    )
     parser.add_argument(
         "--score-threshold",
         type=float,
@@ -1314,10 +1372,11 @@ def parse_args() -> argparse.Namespace:
         help="Remove old metrics/config/checkpoints in output-dir",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    args.best_metric = normalize_best_metric(args.best_metric)
     if args.epochs < 1:
         raise ValueError("--epochs must be at least 1")
     if args.batch_size < 1:
@@ -1513,10 +1572,11 @@ def main() -> None:
         scaler = create_grad_scaler(enabled=amp_enabled)
 
         start_epoch = 1
-        best_map50 = -math.inf
+        best_metric = args.best_metric
+        best_score = -math.inf
 
         if resume_path is not None:
-            start_epoch, best_map50 = restore_checkpoint(
+            start_epoch, best_score = restore_checkpoint(
                 path=resume_path,
                 model=raw_model,
                 optimizer=optimizer,
@@ -1524,6 +1584,7 @@ def main() -> None:
                 scaler=scaler,
                 mapping=mapping,
                 device=device,
+                best_metric=best_metric,
             )
 
         train_model: torch.nn.Module = raw_model
@@ -1646,10 +1707,10 @@ def main() -> None:
                     metrics_row,
                 )
 
-                current_map50 = val_metrics["map50"]
-                is_best = current_map50 > best_map50
+                current_score = best_metric_score(val_metrics, best_metric)
+                is_best = current_score > best_score
                 if is_best:
-                    best_map50 = current_map50
+                    best_score = current_score
             else:
                 is_best = False
 
@@ -1667,7 +1728,8 @@ def main() -> None:
                     epoch=epoch,
                     metrics=metrics_row,
                     mapping=mapping,
-                    best_map50=best_map50,
+                    best_metric=best_metric,
+                    best_score=best_score,
                     args=args,
                 )
 
@@ -1683,7 +1745,8 @@ def main() -> None:
                         epoch=epoch,
                         metrics=metrics_row,
                         mapping=mapping,
-                        best_map50=best_map50,
+                        best_metric=best_metric,
+                        best_score=best_score,
                         args=args,
                     )
                     saved_paths.append(str(output_dir / "best.pt"))
@@ -1714,7 +1777,8 @@ def main() -> None:
                     f"val_map75={val_metrics['map75']:.4f} "
                     f"val_map_small={val_metrics['map_small']:.4f} "
                     f"val_ar100={val_metrics['ar_100']:.4f} "
-                    f"best_map50={best_map50:.4f} "
+                    f"best_metric={format_best_metric(best_metric)} "
+                    f"best_score={best_score:.4f} "
                     f"saved={','.join(saved_paths)}",
                     flush=True,
                 )
