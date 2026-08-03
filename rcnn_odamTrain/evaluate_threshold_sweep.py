@@ -55,7 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--odam-nms-low-thresholds", type=float, nargs="+", default=None)
     parser.add_argument("--odam-nms-high-thresholds", type=float, nargs="+", default=None)
     parser.add_argument("--odam-nms-resize-short-edges", type=int, nargs="+", default=None)
-    parser.add_argument("--no-odam-nms", action="store_true")
+    parser.add_argument(
+        "--odam-nms",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable ODAM-NMS for evaluation. Defaults to the checkpoint config.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -254,7 +259,8 @@ def main() -> None:
         config.pred_cls_threshold = float(pred_cls_threshold)
         config.rcnn_nms_threshold = float(rcnn_nms_threshold)
         config.rcnn_detections_per_image = int(detections_per_image)
-        config.odam_nms = bool(config.odam_nms and not args.no_odam_nms)
+        if args.odam_nms is not None:
+            config.odam_nms = bool(args.odam_nms)
         config.odam_nms_low_threshold = float(odam_nms_low_threshold)
         config.odam_nms_high_threshold = float(odam_nms_high_threshold)
         config.odam_nms_resize_short_edge = int(odam_nms_resize_short_edge)
