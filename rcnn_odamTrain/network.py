@@ -896,9 +896,10 @@ def get_dams(pool_maps, bids, rois, fpn_fms, stride, level_assignments, dam_size
             if len(inds_level)>0:
                 dam_maps = roi_align_inv(\
                     pool_maps[inds_level], rois[inds_level], 1.0/scale_level, fm_level.size()[-2:])    
-                dam_maps = resize(dam_maps)                           
+                dam_maps = resize(torch.nan_to_num(dam_maps, nan=0.0, posinf=0.0, neginf=0.0))
                  # Num_pred,dam_size
-                dam_maps = F.normalize(dam_maps.reshape(len(inds_level), -1))
+                dam_maps = F.normalize(dam_maps.reshape(len(inds_level), -1), p=2, dim=1, eps=1e-12)
+                dam_maps = torch.nan_to_num(dam_maps, nan=0.0, posinf=0.0, neginf=0.0)
                 pred_dams[inds_level,:] = dam_maps
     return pred_dams
 
@@ -941,8 +942,9 @@ def roi_align_inv(pool_dams, rois, scale, map_size):
     rois_start_locs = torch.stack((rois_x_low, rois_y_low), dim=1) # N, 2
     rois_grids = rois_grids.repeat(N,1,1) + rois_start_locs.reshape(N, 1, 2) # N, W_max*H_max, 2
 
+    roi_wh = (rois[:,2:]-rois[:,:2]).clamp(min=1e-6)
     grids_on_pool = ((rois_grids - rois[:,:2].reshape(N,1,2)) / \
-                (rois[:,2:]-rois[:,:2]).reshape(N,1,2)) * \
+                roi_wh.reshape(N,1,2)) * \
                 rois.new_tensor([w_pool-1, h_pool-1]).reshape(1,1,2) # N, W_max*H_max, 2 
 
     grids_x_low, grids_x_high = grids_on_pool[:,:,0].floor(), grids_on_pool[:,:,0].ceil()
@@ -1011,6 +1013,8 @@ def match_loss(
     M, C = dams.shape
     if M == 0:
         return dams.sum() * 0.0
+    dams = torch.nan_to_num(dams, nan=0.0, posinf=0.0, neginf=0.0)
+    pred_gt_iou = torch.nan_to_num(pred_gt_iou, nan=0.0, posinf=0.0, neginf=0.0)
     objs = objs.long()
     bids = bids.long()
 

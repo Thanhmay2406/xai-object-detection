@@ -393,6 +393,19 @@ def reduce_metrics_mean(metrics, context):
     return reduced
 
 
+def all_ranks_loss_is_finite(total_loss, context):
+    is_finite = torch.isfinite(total_loss.detach())
+    if not context.enabled:
+        return bool(is_finite.item())
+    flag = torch.tensor(
+        1.0 if bool(is_finite.item()) else 0.0,
+        device=total_loss.device,
+        dtype=torch.float32,
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
 def resolve_device(args, context):
     if context.enabled:
         device = torch.device(f"cuda:{context.local_rank}")
@@ -1028,8 +1041,11 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, args, conte
                     args,
                     context,
                 )
-        if not torch.isfinite(total_loss):
-            raise RuntimeError(f"Non-finite loss at epoch={epoch} step={step}: {float(total_loss.detach())}")
+        if not all_ranks_loss_is_finite(total_loss, context):
+            raise RuntimeError(
+                f"Non-finite loss detected across ranks at epoch={epoch} step={step}; "
+                f"rank={context.rank} local_loss={float(total_loss.detach())}"
+            )
         if bool(getattr(args, "dpga_odam", False)):
             if args.max_grad_norm is not None:
                 torch.nn.utils.clip_grad_norm_(
