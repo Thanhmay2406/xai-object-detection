@@ -2,7 +2,12 @@ import unittest
 
 import torch
 
-from rcnn_odamTrain.train import compose_dpga_module_gradients, compose_dpga_odam_gradients, dpga_parameter_module
+from rcnn_odamTrain.train import (
+    assign_and_sync_final_gradients,
+    compose_dpga_module_gradients,
+    compose_dpga_odam_gradients,
+    dpga_parameter_module,
+)
 
 
 class _Context:
@@ -96,6 +101,35 @@ class DPGAGradientTests(unittest.TestCase):
         self.assertGreater(stats["stat_dpga_roi_classifier_valid"], 0.0)
         self.assertIsNotNone(model.RCNN.pred_cls.weight.grad)
         self.assertTrue(torch.isfinite(model.RCNN.pred_cls.weight.grad).all())
+
+    def test_compose_uses_detection_only_backward_when_odam_inactive(self):
+        model = _TinyRCNN()
+        x = torch.tensor([[1.0, -2.0]])
+        shared = model.RCNN.fc2(model.RCNN.fc1(x))
+        logits = model.RCNN.pred_cls(shared)
+        det_loss = logits.square().sum()
+        odam_loss = det_loss.detach() * 0.0
+
+        total_loss, stats = compose_dpga_odam_gradients(det_loss, odam_loss, model, _Args(), _Context())
+
+        self.assertTrue(torch.isfinite(total_loss))
+        self.assertEqual(stats["stat_dpga_any_active"], 0.0)
+        self.assertEqual(stats["stat_dpga_detection_only_fallback"], 1.0)
+        self.assertIsNotNone(model.RCNN.pred_cls.weight.grad)
+        self.assertTrue(torch.isfinite(model.RCNN.pred_cls.weight.grad).all())
+
+    def test_assign_gradients_preserves_none_without_distributed_context(self):
+        first = torch.nn.Parameter(torch.zeros(2))
+        second = torch.nn.Parameter(torch.zeros(2))
+        norm = assign_and_sync_final_gradients(
+            [("first", first), ("second", second)],
+            [torch.tensor([3.0, 4.0]), None],
+            _Context(),
+        )
+
+        self.assertAlmostEqual(norm, 5.0)
+        self.assertTrue(torch.equal(first.grad, torch.tensor([3.0, 4.0])))
+        self.assertIsNone(second.grad)
 
 
 if __name__ == "__main__":
