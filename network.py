@@ -2499,26 +2499,33 @@ class DPGAController:
         self,
         loss_det: torch.Tensor,
         loss_odam: torch.Tensor,
+        extract_odam: bool = True,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Không gọi backward().
         autograd.grad lấy riêng g_det và g_odam.
         """
-        g_det_raw = torch.autograd.grad(
-            loss_det,
-            self.params,
-            retain_graph=True,
-            create_graph=False,
-            allow_unused=True,
-        )
+        if loss_det.requires_grad:
+            g_det_raw = torch.autograd.grad(
+                loss_det,
+                self.params,
+                retain_graph=bool(extract_odam and loss_odam.requires_grad),
+                create_graph=False,
+                allow_unused=True,
+            )
+        else:
+            g_det_raw = [None for _ in self.params]
 
-        g_odam_raw = torch.autograd.grad(
-            loss_odam,
-            self.params,
-            retain_graph=False,
-            create_graph=False,
-            allow_unused=True,
-        )
+        if extract_odam and loss_odam.requires_grad:
+            g_odam_raw = torch.autograd.grad(
+                loss_odam,
+                self.params,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+        else:
+            g_odam_raw = [None for _ in self.params]
 
         g_det = _dpga_replace_none(g_det_raw, self.params)
         g_odam = _dpga_replace_none(g_odam_raw, self.params)
@@ -2730,9 +2737,15 @@ class DPGAController:
 
         alpha = self.alpha(epoch) * max(float(aux_scale), 0.0)
 
+        extract_odam = (
+            alpha > 0.0
+            and bool(loss_odam.requires_grad)
+        )
+
         g_det_flat, g_odam_flat = self._extract_gradients(
             loss_det,
             loss_odam,
+            extract_odam=extract_odam,
         )
 
         det_by_group = self._split_by_group(g_det_flat)
