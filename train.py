@@ -1440,6 +1440,79 @@ def write_train_log(iterator, message: str):
         print(message)
 
 
+def _first_nonfinite_tensor(
+    tensors: Dict[str, torch.Tensor],
+) -> Optional[Tuple[str, str, float]]:
+    for name, tensor in tensors.items():
+        if tensor is None or not torch.is_tensor(tensor):
+            continue
+        if not tensor.is_floating_point():
+            continue
+        finite = torch.isfinite(tensor)
+        if bool(finite.all()):
+            continue
+        bad = tensor.detach()[~finite]
+        if bool(torch.isnan(bad).any()):
+            kind = "nan"
+        elif bool(torch.isinf(bad).any()):
+            kind = "inf"
+        else:
+            kind = "nonfinite"
+        sample = float(bad.flatten()[0].detach().cpu())
+        return name, kind, sample
+    return None
+
+
+def assert_finite_training_state(
+    stage: str,
+    epoch: int,
+    step: int,
+    rank: int,
+    method: str,
+    tensors: Optional[Dict[str, torch.Tensor]] = None,
+    model: Optional[nn.Module] = None,
+    check_grads: bool = False,
+):
+    if tensors:
+        bad = _first_nonfinite_tensor(tensors)
+        if bad is not None:
+            name, kind, sample = bad
+            raise FloatingPointError(
+                "[nonfinite] "
+                f"stage={stage} epoch={epoch} step={step} "
+                f"rank={rank} method={method} tensor={name} "
+                f"kind={kind} sample={sample}"
+            )
+
+    if model is None:
+        return
+
+    raw_model = unwrap_model(model)
+    items = raw_model.named_parameters()
+    for name, param in items:
+        tensor = param.grad if check_grads else param
+        if tensor is None or not tensor.is_floating_point():
+            continue
+        finite = torch.isfinite(tensor)
+        if bool(finite.all()):
+            continue
+        bad = tensor.detach()[~finite]
+        if bool(torch.isnan(bad).any()):
+            kind = "nan"
+        elif bool(torch.isinf(bad).any()):
+            kind = "inf"
+        else:
+            kind = "nonfinite"
+        sample = float(bad.flatten()[0].detach().cpu())
+        target = "grad" if check_grads else "param"
+        raise FloatingPointError(
+            "[nonfinite] "
+            f"stage={stage} epoch={epoch} step={step} "
+            f"rank={rank} method={method} {target}={name} "
+            f"kind={kind} sample={sample}"
+        )
+
+
 def should_log_step(args, step: int, total_steps: int) -> bool:
     interval = int(args.log_interval)
     return (
@@ -1601,6 +1674,19 @@ def train_one_epoch(
             loss_det, loss_odam = split_detection_and_odam_loss(
                 loss_dict
             )
+            if getattr(args, "finite_checks", True):
+                assert_finite_training_state(
+                    stage="after_forward_loss",
+                    epoch=epoch,
+                    step=step,
+                    rank=rank,
+                    method=args.method,
+                    tensors={
+                        **loss_dict,
+                        "loss_det": loss_det,
+                        "loss_odam": loss_odam,
+                    },
+                )
 
             if args.method == "baseline":
                 objective = loss_det
@@ -1657,6 +1743,18 @@ def train_one_epoch(
             else:
                 raise ValueError(args.method)
 
+        if getattr(args, "finite_checks", True):
+            assert_finite_training_state(
+                stage="after_backward",
+                epoch=epoch,
+                step=step,
+                rank=rank,
+                method=args.method,
+                tensors={"objective": objective},
+                model=model,
+                check_grads=True,
+            )
+
         if args.method in ("dpga", "rapg"):
             manual_allreduce_grads(model)
 
@@ -1665,8 +1763,27 @@ def train_one_epoch(
                 raw_model.parameters(),
                 max_norm=args.grad_clip,
             )
+            if getattr(args, "finite_checks", True):
+                assert_finite_training_state(
+                    stage="after_grad_clip",
+                    epoch=epoch,
+                    step=step,
+                    rank=rank,
+                    method=args.method,
+                    model=model,
+                    check_grads=True,
+                )
 
         optimizer.step()
+        if getattr(args, "finite_checks", True):
+            assert_finite_training_state(
+                stage="after_optimizer_step",
+                epoch=epoch,
+                step=step,
+                rank=rank,
+                method=args.method,
+                model=model,
+            )
         append_gradient_diagnostics(
             output_dir,
             diagnostic_rows,
@@ -2268,6 +2385,16 @@ def parse_args():
     )
     parser.add_argument("--lr-gamma", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=0.0)
+    parser.add_argument(
+        "--no-finite-checks",
+        dest="finite_checks",
+        action="store_false",
+        help=(
+            "Disable fail-fast NaN/Inf checks for losses, gradients, and "
+            "model parameters. Default is fail-closed."
+        ),
+    )
+    parser.set_defaults(finite_checks=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--log-interval",
