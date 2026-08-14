@@ -301,7 +301,10 @@ class ResNet50(nn.Module):
             p.requires_grad = False
 
     def freeze_backbone(self, freeze_at: int):
-        if freeze_at < 0:
+        freeze_at = int(freeze_at)
+        if freeze_at not in (0, 1, 2):
+            raise ValueError("backbone_freeze_at must be one of {0, 1, 2}")
+        if freeze_at == 0:
             return
         if freeze_at >= 1:
             self._freeze_module(self.conv1)
