@@ -23,7 +23,7 @@ Lưu ý:
 import math
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -999,10 +999,16 @@ class Network(nn.Module):
         self.RCNN.set_odam_inference(enabled)
 
     def set_rapg_enabled(self, enabled: bool):
-        self.RCNN.set_rapg_enabled(enabled)
+        if bool(enabled):
+            raise ValueError(
+                "RAPG has been removed from network.py; "
+                "use method baseline, odam, or dpga."
+            )
+        return None
 
     def set_rapg_config(self, **kwargs):
-        self.RCNN.set_rapg_config(**kwargs)
+        del kwargs
+        return None
 
     def forward(self, image, im_info, gt_boxes=None):
         config = self.config
@@ -1079,14 +1085,6 @@ class RCNN(nn.Module):
         self.config = config
         self.odam_enabled = True
         self.odam_inference = False
-        self.rapg_enabled = False
-        self.rapg_min_iou = 0.7
-        self.rapg_min_score = 0.9
-        self.rapg_topk_per_gt = 2
-        self.rapg_min_reliable = 2
-        self.rapg_negative_iou_threshold = 0.1
-        self.rapg_require_correct_class = True
-        self.last_rapg_stats = None
 
         self.fc1 = nn.Linear(256 * 7 * 7, 1024)
         self.fc2 = nn.Linear(1024, 1024)
@@ -1110,152 +1108,6 @@ class RCNN(nn.Module):
     def set_odam_inference(self, enabled: bool):
         self.odam_inference = bool(enabled)
 
-    def set_rapg_enabled(self, enabled: bool):
-        self.rapg_enabled = bool(enabled)
-
-    def set_rapg_config(self, **kwargs):
-        allowed = {
-            "rapg_min_iou",
-            "rapg_min_score",
-            "rapg_topk_per_gt",
-            "rapg_min_reliable",
-            "rapg_negative_iou_threshold",
-            "rapg_require_correct_class",
-        }
-        unknown = sorted(set(kwargs) - allowed)
-        if unknown:
-            raise ValueError(
-                "Unknown RAPG config field(s): " + ", ".join(unknown)
-            )
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-        self.validate_rapg_config()
-
-    def validate_rapg_config(self):
-        if not 0.0 <= float(self.rapg_min_iou) <= 1.0:
-            raise ValueError("rapg_min_iou must be in [0, 1]")
-        if not 0.0 <= float(self.rapg_min_score) <= 1.0:
-            raise ValueError("rapg_min_score must be in [0, 1]")
-        if int(self.rapg_topk_per_gt) < 1:
-            raise ValueError("rapg_topk_per_gt must be >= 1")
-        if int(self.rapg_min_reliable) < 1:
-            raise ValueError("rapg_min_reliable must be >= 1")
-        if int(self.rapg_min_reliable) > int(self.rapg_topk_per_gt):
-            raise ValueError(
-                "rapg_min_reliable must be <= rapg_topk_per_gt"
-            )
-        if not 0.0 <= float(self.rapg_negative_iou_threshold) <= 1.0:
-            raise ValueError("rapg_negative_iou_threshold must be in [0, 1]")
-
-    def _empty_rapg_stats(self, num_positive: int = 0) -> Dict[str, float]:
-        return {
-            "num_candidate": float(num_positive),
-            "num_positive": float(num_positive),
-            "num_reliable": 0.0,
-            "reliability_sum": 0.0,
-            "reliability_count": 0.0,
-            "reliable_ratio": 0.0,
-            "mean_iou": 0.0,
-            "mean_score": 0.0,
-            "same_pairs": 0.0,
-            "negative_pairs": 0.0,
-            "mean_pair_quality": 0.0,
-            "empty_pair": 1.0,
-            "batch_reliability": 0.0,
-            "fallback": 1.0,
-        }
-
-    def _select_rapg_reliable_fg(
-        self,
-        pred_cls: torch.Tensor,
-        fg_masks: torch.Tensor,
-        fg_gt_classes: torch.Tensor,
-        assigned_gts_fg: torch.Tensor,
-        fg_batch_ids: torch.Tensor,
-        pred_gt_ious: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
-        device = pred_cls.device
-        num_positive = int(fg_masks.sum().detach().cpu())
-        if num_positive == 0:
-            return (
-                torch.zeros((0,), dtype=torch.bool, device=device),
-                torch.zeros((0,), dtype=pred_cls.dtype, device=device),
-                self._empty_rapg_stats(0),
-            )
-
-        fg_logits = pred_cls[fg_masks]
-        fg_probs = F.softmax(fg_logits, dim=1)
-        class_scores = fg_probs.gather(
-            1,
-            fg_gt_classes.view(-1, 1),
-        ).squeeze(1)
-        predicted_classes = fg_logits.argmax(dim=1)
-
-        reliable = (
-            (pred_gt_ious >= float(self.rapg_min_iou))
-            & (class_scores >= float(self.rapg_min_score))
-            & torch.isfinite(pred_gt_ious)
-            & torch.isfinite(class_scores)
-        )
-        if bool(self.rapg_require_correct_class):
-            reliable = reliable & (predicted_classes == fg_gt_classes)
-
-        reliability_score = torch.sqrt(
-            pred_gt_ious.clamp(min=0.0)
-            * class_scores.clamp(min=0.0)
-        ).detach()
-
-        keep = torch.zeros_like(reliable)
-        topk = max(int(self.rapg_topk_per_gt), 1)
-        min_reliable = max(int(self.rapg_min_reliable), 1)
-        object_ids = image_aware_object_ids(
-            assigned_gts_fg,
-            fg_batch_ids,
-        )
-        for object_id in torch.unique(object_ids[reliable]):
-            candidates = torch.nonzero(
-                reliable & (object_ids == object_id),
-                as_tuple=False,
-            ).squeeze(1)
-            if candidates.numel() > topk:
-                scores = reliability_score[candidates]
-                candidates = candidates[torch.argsort(scores, descending=True)[:topk]]
-            if candidates.numel() < min_reliable:
-                continue
-            keep[candidates] = True
-
-        reliable_count = int(keep.sum().detach().cpu())
-        if reliable_count == 0:
-            stats = self._empty_rapg_stats(num_positive)
-            return keep, reliability_score, stats
-
-        kept_quality = reliability_score[keep]
-        kept_objs = object_ids[keep]
-        reliability_sum = float(kept_quality.sum().detach().cpu())
-        same_pairs = 0
-        for gt_id in torch.unique(kept_objs):
-            count = int((kept_objs == gt_id).sum().detach().cpu())
-            same_pairs += max(count * (count - 1), 0)
-
-        batch_reliability = float(kept_quality.mean().detach().cpu())
-        stats = {
-            "num_candidate": float(num_positive),
-            "num_positive": float(num_positive),
-            "num_reliable": float(reliable_count),
-            "reliability_sum": reliability_sum,
-            "reliability_count": float(reliable_count),
-            "reliable_ratio": float(reliable_count) / max(float(num_positive), 1.0),
-            "mean_iou": float(pred_gt_ious[keep].mean().detach().cpu()),
-            "mean_score": float(class_scores[keep].mean().detach().cpu()),
-            "same_pairs": float(same_pairs),
-            "negative_pairs": 0.0,
-            "mean_pair_quality": batch_reliability,
-            "empty_pair": 0.0,
-            "batch_reliability": batch_reliability,
-            "fallback": 0.0,
-        }
-        return keep, reliability_score, stats
-
     @torch.enable_grad()
     def forward(
         self,
@@ -1265,7 +1117,6 @@ class RCNN(nn.Module):
         bbox_targets=None,
         assigned_gts=None,
     ):
-        self.last_rapg_stats = None
         config = self.config
         bbox_stds = config.bbox_normalize_stds
         bbox_means = config.bbox_normalize_means
@@ -1393,32 +1244,6 @@ class RCNN(nn.Module):
             fg_inds = fg_masks.nonzero(as_tuple=True)[0]
             assigned_gts_fg = assigned_gts[fg_masks]
             fg_batch_ids = rcnn_rois[fg_masks, 0].long()
-            selected_local = torch.ones_like(fg_gt_classes, dtype=torch.bool)
-            rapg_quality = None
-
-            if self.rapg_enabled:
-                selected_local, rapg_quality_all, rapg_stats = (
-                    self._select_rapg_reliable_fg(
-                        pred_cls=pred_cls,
-                        fg_masks=fg_masks,
-                        fg_gt_classes=fg_gt_classes,
-                        assigned_gts_fg=assigned_gts_fg,
-                        fg_batch_ids=fg_batch_ids,
-                        pred_gt_ious=pred_gt_ious,
-                    )
-                )
-                rapg_quality = rapg_quality_all[selected_local]
-                self.last_rapg_stats = rapg_stats
-                if int(selected_local.sum().detach().cpu()) <= 0:
-                    self.last_rapg_stats["fallback"] = 1.0
-                    return {
-                        "loss_rcnn_loc": loss_rcnn_loc,
-                        "loss_rcnn_cls": loss_rcnn_cls,
-                        "loss_rcnn_match": pred_delta.sum() * 0.0,
-                    }
-
-            selected_fg_inds = fg_inds[selected_local]
-            selected_fg_classes = fg_gt_classes[selected_local]
             pool_grads = self.get_gradient(
                 pred_cls,
                 pool_features,
@@ -1427,20 +1252,20 @@ class RCNN(nn.Module):
             pool_dams = F.relu(
                 (
                     pool_grads[
-                        selected_fg_inds,
-                        selected_fg_classes - 1,
+                        fg_inds,
+                        fg_gt_classes - 1,
                         :, :, :
                     ]
-                    * pool_features[selected_fg_inds]
+                    * pool_features[fg_inds]
                 ).sum(1)
             )
 
             # common DAM size = stride-16 FPN map
             dam_size = fpn_fms[2].size()[-2:]
 
-            rois_fg = rcnn_rois[selected_fg_inds, 1:5]
-            bids = rcnn_rois[selected_fg_inds, 0].long()
-            level_assignments_fg = level_assignments[selected_fg_inds]
+            rois_fg = rcnn_rois[fg_inds, 1:5]
+            bids = rcnn_rois[fg_inds, 0].long()
+            level_assignments_fg = level_assignments[fg_inds]
 
             pred_dams = get_dams(
                 pool_dams,
@@ -1452,50 +1277,12 @@ class RCNN(nn.Module):
                 dam_size,
             )
 
-            assigned_gts_selected = assigned_gts_fg[selected_local]
-            batch_ids_selected = fg_batch_ids[selected_local]
-            pred_bbox_selected = pred_bbox[selected_local]
-            pred_gt_ious_selected = pred_gt_ious[selected_local]
-
-            if self.rapg_enabled and self.last_rapg_stats is not None:
-                with torch.no_grad():
-                    same_obj, neg_mask, _ = image_aware_pair_masks(
-                        assigned_gts_selected,
-                        batch_ids_selected,
-                        pred_bbox_selected,
-                        negative_iou_threshold=float(
-                            self.rapg_negative_iou_threshold
-                        ),
-                        include_self_pairs=False,
-                    )
-                    same_pairs = int(same_obj.sum().detach().cpu())
-                    negative_pairs = int(
-                        neg_mask.sum().detach().cpu()
-                    )
-                    empty_pair = same_pairs + negative_pairs <= 0
-                    self.last_rapg_stats["same_pairs"] = float(same_pairs)
-                    self.last_rapg_stats["negative_pairs"] = float(negative_pairs)
-                    self.last_rapg_stats["empty_pair"] = float(empty_pair)
-                    if empty_pair:
-                        self.last_rapg_stats["fallback"] = 1.0
-                        return {
-                            "loss_rcnn_loc": loss_rcnn_loc,
-                            "loss_rcnn_cls": loss_rcnn_cls,
-                            "loss_rcnn_match": pred_delta.sum() * 0.0,
-                        }
-
             loss_rcnn_match = match_loss(
                 pred_dams,
-                assigned_gts_selected,
-                batch_ids_selected,
-                pred_bbox_selected,
-                pred_gt_ious_selected,
-                proposal_quality=rapg_quality,
-                negative_iou_threshold=(
-                    float(self.rapg_negative_iou_threshold)
-                    if self.rapg_enabled else 0.0
-                ),
-                include_self_pairs=not self.rapg_enabled,
+                assigned_gts_fg,
+                fg_batch_ids,
+                pred_bbox,
+                pred_gt_ious,
             )
 
             # DPGA NOTE:
@@ -1975,58 +1762,39 @@ def image_aware_pair_masks(
     )
     overlap_mask = pred_paired_iou > float(negative_iou_threshold)
     neg_mask = same_image & overlap_mask & (~same_object_full) & (~eye)
+    assert not torch.diag(neg_mask).any()
 
     return same_obj, neg_mask, object_ids
 
 
 def match_loss(
-    dams,
-    objs,
-    batch_ids_or_pred_bbox,
-    pred_bbox=None,
-    pred_gt_iou=None,
-    proposal_quality: Optional[torch.Tensor] = None,
-    negative_iou_threshold: float = 0.0,
-    include_self_pairs: bool = True,
+    dams: torch.Tensor,
+    gt_ids: torch.Tensor,
+    batch_ids: torch.Tensor,
+    pred_bbox: torch.Tensor,
+    pred_gt_iou: torch.Tensor,
 ):
     """
     Positive:
         prediction thuộc cùng GT -> DAM similarity -> 1
     Negative:
         prediction thuộc GT khác nhưng bbox overlap -> DAM similarity -> 0
-
-    New call signature passes batch ids explicitly:
-        match_loss(dams, gt_ids, batch_ids, pred_bbox, pred_gt_iou, ...)
-
-    Legacy single-image calls are still accepted:
-        match_loss(dams, gt_ids, pred_bbox, pred_gt_iou, ...)
     """
-    if pred_gt_iou is None:
-        if pred_bbox is None:
-            raise TypeError("pred_bbox and pred_gt_iou are required")
-        pred_gt_iou = pred_bbox
-        pred_bbox = batch_ids_or_pred_bbox
-        batch_ids = objs.new_zeros(objs.shape, dtype=torch.long)
-    else:
-        batch_ids = batch_ids_or_pred_bbox
-
     if dams.numel() == 0:
         return pred_bbox.sum() * 0.0
 
     M, _ = dams.shape
 
-    objs = objs.long()
+    gt_ids = gt_ids.long()
     batch_ids = batch_ids.long()
 
-    if objs.numel() == 0:
+    if gt_ids.numel() == 0:
         return pred_bbox.sum() * 0.0
 
     same_obj, neg_mask, object_ids = image_aware_pair_masks(
-        objs,
+        gt_ids,
         batch_ids,
         pred_bbox,
-        negative_iou_threshold=negative_iou_threshold,
-        include_self_pairs=include_self_pairs,
     )
 
     num_gt = int(object_ids.max().item()) + 1
@@ -2057,71 +1825,40 @@ def match_loss(
 
     ref_dams = dams[max_position]
 
-    eps = 1e-4
-    if proposal_quality is not None:
-        proposal_quality = proposal_quality.to(
-            device=dams.device,
-            dtype=dams.dtype,
-        ).detach().clamp(min=0.0)
-        ref_quality = proposal_quality[max_position]
-
     pos_sims = (
         ref_dams[pos_pair1]
         * dams[pos_pair2]
-    ).sum(-1).clamp(min=eps, max=1 - eps)
+    ).sum(-1).clamp(min=1e-4, max=1 - 1e-4)
 
     neg_sims = (
         ref_dams[neg_pair1]
         * dams[neg_pair2]
-    ).sum(-1).clamp(min=eps, max=1 - eps)
+    ).sum(-1).clamp(min=1e-4, max=1 - 1e-4)
 
     if pos_sims.numel() > 0:
-        if proposal_quality is not None:
-            pos_weights = torch.sqrt(
-                ref_quality[pos_pair1]
-                * proposal_quality[pos_pair2]
-            ).clamp(min=eps)
-        else:
-            pos_weights = (
-                pred_gt_iou[pos_pair2]
-                / max_iou[pos_pair1].clamp(min=eps)
-            )
+        pos_weights = (
+            pred_gt_iou[pos_pair2]
+            / max_iou[pos_pair1].clamp(min=1e-4)
+        )
 
         pos_term = (
             pos_weights
             * (-torch.log(pos_sims))
         ).sum()
-        pos_denom = pos_weights.sum()
     else:
         pos_term = pred_bbox.sum() * 0.0
-        pos_denom = pred_bbox.new_zeros(())
 
     if neg_sims.numel() > 0:
-        if proposal_quality is not None:
-            neg_weights = torch.sqrt(
-                ref_quality[neg_pair1]
-                * proposal_quality[neg_pair2]
-            ).clamp(min=eps)
-        else:
-            neg_weights = neg_sims.new_ones(neg_sims.shape)
-
         neg_term = (
-            neg_weights
-            *
             -torch.log(1 - neg_sims)
         ).sum()
-        neg_denom = neg_weights.sum()
     else:
         neg_term = pred_bbox.sum() * 0.0
-        neg_denom = pred_bbox.new_zeros(())
 
-    if proposal_quality is not None:
-        denom = (pos_denom + neg_denom).clamp(min=eps)
-    else:
-        denom = max(
-            1,
-            int(pos_sims.numel() + neg_sims.numel()),
-        )
+    denom = max(
+        1,
+        int(pos_sims.numel() + neg_sims.numel()),
+    )
 
     return (pos_term + neg_term) / denom
 
@@ -2349,8 +2086,6 @@ class DPGAStats:
     modules: Dict[str, DPGAModuleStats]
     gradient_scope: str = "local"
     world_size: int = 1
-    base_alpha: float = 0.0
-    aux_scale: float = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -2940,8 +2675,8 @@ class DPGAController:
         loss_det: torch.Tensor,
         loss_odam: torch.Tensor,
         epoch: float,
-        aux_scale: float = 1.0,
         sync_distributed: bool = True,
+        **unused_kwargs,
     ) -> DPGAStats:
         """
         Tạo final gradients và ghi vào param.grad.
@@ -2952,15 +2687,15 @@ class DPGAController:
         Sau hàm này:
             optimizer.step()
         """
+        del unused_kwargs
+
         if loss_det.ndim != 0:
             loss_det = loss_det.sum()
 
         if loss_odam.ndim != 0:
             loss_odam = loss_odam.sum()
 
-        base_alpha = self.alpha(epoch)
-        aux_scale = max(float(aux_scale), 0.0)
-        alpha = base_alpha * aux_scale
+        alpha = self.alpha(epoch)
 
         extract_odam = (
             alpha > 0.0
@@ -3006,8 +2741,6 @@ class DPGAController:
             modules=stats_dict,
             gradient_scope=gradient_scope,
             world_size=world_size,
-            base_alpha=base_alpha,
-            aux_scale=aux_scale,
         )
 
 
@@ -3019,8 +2752,6 @@ def format_dpga_stats(stats: DPGAStats) -> str:
     lines = [
         (
             f"DPGA alpha={stats.alpha:.4f} "
-            f"base_alpha={stats.base_alpha:.4f} "
-            f"aux_scale={stats.aux_scale:.4f} "
             f"scope={stats.gradient_scope} "
             f"world_size={stats.world_size}"
         )
@@ -3055,9 +2786,8 @@ def dpga_training_step(
     Deprecated convenience helper for small local DPGA smoke tests.
 
     Use train.py for final experiments. This helper does not implement the full
-    experiment pipeline around DPGA/RAPG, including fractional-step scheduling,
-    RAPG proposal-weighted global reliability logging, artifact schema guards,
-    or method-specific ODAM warm-up toggling.
+    experiment pipeline, including fractional-step scheduling, diagnostics,
+    artifact schema guards, or method-specific ODAM warm-up toggling.
 
     Example
     -------
@@ -3084,8 +2814,7 @@ def dpga_training_step(
     """
     warnings.warn(
         "dpga_training_step() is deprecated for experiment runs; use train.py "
-        "so DPGA/RAPG scheduling, RAPG reliability aggregation, diagnostics, "
-        "and artifact guards stay aligned.",
+        "so DPGA scheduling, diagnostics, and artifact guards stay aligned.",
         DeprecationWarning,
         stacklevel=2,
     )
