@@ -36,6 +36,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 
 INF = 100000000
+DPGA_ALLREDUCE_BUCKET_BYTES = 32 * 1024 * 1024
 
 
 # =============================================================================
@@ -1128,6 +1129,23 @@ class RCNN(nn.Module):
             )
         for key, value in kwargs.items():
             setattr(self, key, value)
+        self.validate_rapg_config()
+
+    def validate_rapg_config(self):
+        if not 0.0 <= float(self.rapg_min_iou) <= 1.0:
+            raise ValueError("rapg_min_iou must be in [0, 1]")
+        if not 0.0 <= float(self.rapg_min_score) <= 1.0:
+            raise ValueError("rapg_min_score must be in [0, 1]")
+        if int(self.rapg_topk_per_gt) < 1:
+            raise ValueError("rapg_topk_per_gt must be >= 1")
+        if int(self.rapg_min_reliable) < 1:
+            raise ValueError("rapg_min_reliable must be >= 1")
+        if int(self.rapg_min_reliable) > int(self.rapg_topk_per_gt):
+            raise ValueError(
+                "rapg_min_reliable must be <= rapg_topk_per_gt"
+            )
+        if not 0.0 <= float(self.rapg_negative_iou_threshold) <= 1.0:
+            raise ValueError("rapg_negative_iou_threshold must be in [0, 1]")
 
     def _empty_rapg_stats(self, num_positive: int = 0) -> Dict[str, float]:
         return {
@@ -2411,27 +2429,69 @@ def _dpga_distributed_world_size() -> int:
     return 1
 
 
+def _dpga_allreduce_buckets(
+    grads: Sequence[torch.Tensor],
+    max_bucket_bytes: int = DPGA_ALLREDUCE_BUCKET_BYTES,
+) -> List[List[int]]:
+    if int(max_bucket_bytes) <= 0:
+        raise ValueError("max_bucket_bytes must be > 0")
+
+    grouped: Dict[Tuple[torch.device, torch.dtype], List[List[int]]] = {}
+    active: Dict[Tuple[torch.device, torch.dtype], List[int]] = {}
+    active_bytes: Dict[Tuple[torch.device, torch.dtype], int] = {}
+
+    for idx, grad in enumerate(grads):
+        key = (grad.device, grad.dtype)
+        nbytes = int(grad.numel()) * int(grad.element_size())
+        nbytes = max(nbytes, 1)
+
+        if key not in active:
+            active[key] = []
+            active_bytes[key] = 0
+
+        if (
+            active[key]
+            and active_bytes[key] + nbytes > int(max_bucket_bytes)
+        ):
+            grouped.setdefault(key, []).append(active[key])
+            active[key] = []
+            active_bytes[key] = 0
+
+        active[key].append(idx)
+        active_bytes[key] += nbytes
+
+    for key, indices in active.items():
+        if indices:
+            grouped.setdefault(key, []).append(indices)
+
+    buckets = []
+    for per_dtype_buckets in grouped.values():
+        buckets.extend(per_dtype_buckets)
+    return buckets
+
+
 def _dpga_allreduce_mean(
     grads: Sequence[torch.Tensor],
+    max_bucket_bytes: int = DPGA_ALLREDUCE_BUCKET_BYTES,
 ) -> List[torch.Tensor]:
     """
     Average gradient tensors across DDP ranks before DPGA composition.
 
     DPGA is nonlinear, so averaging the already-composed final gradients is not
     equivalent to composing from globally averaged detection/ODAM gradients.
-    Tensors are bucketed by device/dtype to avoid one collective per parameter.
+    Tensors are bucketed by device/dtype and bounded size to avoid one
+    collective per parameter without creating a single very large flat buffer.
     """
     world_size = _dpga_distributed_world_size()
     out = [g.detach().clone() for g in grads]
     if world_size <= 1:
         return out
 
-    buckets: Dict[Tuple[torch.device, torch.dtype], List[int]] = {}
-    for idx, grad in enumerate(out):
-        buckets.setdefault((grad.device, grad.dtype), []).append(idx)
-
     with torch.no_grad():
-        for indices in buckets.values():
+        for indices in _dpga_allreduce_buckets(
+            out,
+            max_bucket_bytes=max_bucket_bytes,
+        ):
             if not indices:
                 continue
             flat = torch.cat([
@@ -2456,8 +2516,12 @@ def _dpga_allreduce_mean(
 
 def allreduce_gradient_list_mean(
     grads: Sequence[torch.Tensor],
+    max_bucket_bytes: int = DPGA_ALLREDUCE_BUCKET_BYTES,
 ) -> List[torch.Tensor]:
-    return _dpga_allreduce_mean(grads)
+    return _dpga_allreduce_mean(
+        grads,
+        max_bucket_bytes=max_bucket_bytes,
+    )
 
 
 # -----------------------------------------------------------------------------
