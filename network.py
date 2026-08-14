@@ -14,8 +14,8 @@ Phụ thuộc bên ngoài:
     pip install torch torchvision
 
 Lưu ý:
-- Backbone khởi tạo weights=None. Nếu bạn có checkpoint/pretrained weights,
-  hãy load state_dict sau khi tạo Network.
+- Backbone chỉ freeze stage sau khi có pretrained weights hoặc checkpoint
+  tương thích đã được load.
 - Phần RPN/ROI target ở đây là implementation tương thích theo Faster R-CNN
   và cấu hình ODAM, không phụ thuộc các module riêng của repo tác giả.
 """
@@ -30,7 +30,7 @@ import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
 from torchvision import transforms
-from torchvision.models import resnet50
+from torchvision.models import ResNet50_Weights, resnet50
 from torchvision.ops import roi_align, nms
 from torchvision.ops.misc import FrozenBatchNorm2d
 
@@ -274,13 +274,14 @@ class ResNet50(nn.Module):
       [C2, C3, C4, C5]
     """
 
-    def __init__(self, freeze_at: int, has_bias: bool = False):
+    def __init__(self, pretrained: bool = False, has_bias: bool = False):
         super().__init__()
 
         # has_bias được giữ trong signature để tương thích code cũ.
         # torchvision ResNet dùng bias=False cho conv khi có norm.
+        weights = ResNet50_Weights.DEFAULT if bool(pretrained) else None
         base = resnet50(
-            weights=None,
+            weights=weights,
             norm_layer=FrozenBatchNorm2d,
         )
 
@@ -293,13 +294,13 @@ class ResNet50(nn.Module):
         self.layer3 = base.layer3
         self.layer4 = base.layer4
 
-        self._freeze_backbone(freeze_at)
+        self.has_pretrained_weights = bool(pretrained)
 
     def _freeze_module(self, module):
         for p in module.parameters():
             p.requires_grad = False
 
-    def _freeze_backbone(self, freeze_at):
+    def freeze_backbone(self, freeze_at: int):
         if freeze_at < 0:
             return
         if freeze_at >= 1:
@@ -565,10 +566,16 @@ def build_rpn_targets(config, gt_boxes, im_info, anchors):
     gt_boxes: [max_gt, >=5]
     """
     num_gt = int(im_info[5]) if im_info.numel() > 5 else gt_boxes.shape[0]
-    valid_gt = gt_boxes[:num_gt]
+    all_gt = gt_boxes[:num_gt]
+    if all_gt.numel() > 0:
+        all_gt = all_gt.to(device=anchors.device, dtype=anchors.dtype)
 
-    if valid_gt.shape[1] >= 5:
-        valid_gt = valid_gt[valid_gt[:, 4] > 0]
+    if all_gt.shape[1] >= 5 and all_gt.numel() > 0:
+        positive_gt = all_gt[all_gt[:, 4] > 0]
+        ignore_gt = all_gt[all_gt[:, 4] == int(config.ignore_label)]
+    else:
+        positive_gt = all_gt
+        ignore_gt = all_gt.new_zeros((0, all_gt.shape[1])) if all_gt.numel() else anchors.new_zeros((0, 5))
 
     labels = torch.full(
         (anchors.shape[0],),
@@ -578,14 +585,29 @@ def build_rpn_targets(config, gt_boxes, im_info, anchors):
     )
     targets = anchors.new_zeros((anchors.shape[0], 4))
 
-    if valid_gt.numel() == 0:
+    def apply_ignore_regions():
+        if ignore_gt.numel() == 0:
+            return
+        _, ignore_ioa = box_overlap_ignore_opr(
+            anchors,
+            ignore_gt,
+            ignore_label=int(config.ignore_label),
+        )
+        if ignore_ioa.numel() == 0:
+            return
+        max_ignore_ioa = ignore_ioa.max(dim=1).values
+        ignore_anchor = max_ignore_ioa >= float(config.rpn_ignore_overlap)
+        # Ignore/crowd regions suppress background anchors but do not erase
+        # anchors already assigned to a positive training object.
+        labels[(labels == 0) & ignore_anchor] = int(config.ignore_label)
+
+    if positive_gt.numel() == 0:
         labels.fill_(0)
+        apply_ignore_regions()
         labels = _subsample_rpn_labels(config, labels)
         return labels, targets
 
-    valid_gt = valid_gt.to(device=anchors.device, dtype=anchors.dtype)
-
-    overlaps = box_overlap_opr(anchors, valid_gt[:, :4])
+    overlaps = box_overlap_opr(anchors, positive_gt[:, :4])
     max_iou, argmax_gt = overlaps.max(dim=1)
 
     labels[max_iou < config.rpn_negative_overlap] = 0
@@ -595,12 +617,14 @@ def build_rpn_targets(config, gt_boxes, im_info, anchors):
     gt_best_anchor = overlaps.argmax(dim=0)
     labels[gt_best_anchor] = 1
     argmax_gt[gt_best_anchor] = torch.arange(
-        valid_gt.shape[0], device=anchors.device, dtype=argmax_gt.dtype
+        positive_gt.shape[0], device=anchors.device, dtype=argmax_gt.dtype
     )
+
+    apply_ignore_regions()
 
     targets = bbox_transform_opr(
         anchors,
-        valid_gt[argmax_gt, :4],
+        positive_gt[argmax_gt, :4],
     )
 
     if getattr(config, "rpn_bbox_normalize_targets", False):
@@ -987,7 +1011,10 @@ class Network(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.resnet50 = ResNet50(config.backbone_freeze_at, False)
+        self.resnet50 = ResNet50(
+            pretrained=bool(getattr(config, "backbone_pretrained", False)),
+            has_bias=False,
+        )
         self.FPN = FPN(self.resnet50, 2, 6)
         self.RPN = RPN(config)
         self.RCNN = RCNN(config)
@@ -998,17 +1025,8 @@ class Network(nn.Module):
     def set_odam_inference(self, enabled: bool):
         self.RCNN.set_odam_inference(enabled)
 
-    def set_rapg_enabled(self, enabled: bool):
-        if bool(enabled):
-            raise ValueError(
-                "RAPG has been removed from network.py; "
-                "use method baseline, odam, or dpga."
-            )
-        return None
-
-    def set_rapg_config(self, **kwargs):
-        del kwargs
-        return None
+    def freeze_backbone(self, freeze_at: int):
+        self.resnet50.freeze_backbone(int(freeze_at))
 
     def forward(self, image, im_info, gt_boxes=None):
         config = self.config
@@ -1713,7 +1731,7 @@ def image_aware_pair_masks(
     batch_ids: torch.Tensor,
     pred_bbox: torch.Tensor,
     negative_iou_threshold: float = 0.0,
-    include_self_pairs: bool = True,
+    include_self_pairs: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build ODAM pair masks without crossing image boundaries.
@@ -1780,8 +1798,9 @@ def match_loss(
     Negative:
         prediction thuộc GT khác nhưng bbox overlap -> DAM similarity -> 0
     """
+    zero_loss = dams.sum() * 0.0 + pred_bbox.sum() * 0.0
     if dams.numel() == 0:
-        return pred_bbox.sum() * 0.0
+        return zero_loss
 
     M, _ = dams.shape
 
@@ -1789,12 +1808,13 @@ def match_loss(
     batch_ids = batch_ids.long()
 
     if gt_ids.numel() == 0:
-        return pred_bbox.sum() * 0.0
+        return zero_loss
 
     same_obj, neg_mask, object_ids = image_aware_pair_masks(
         gt_ids,
         batch_ids,
         pred_bbox,
+        include_self_pairs=False,
     )
 
     num_gt = int(object_ids.max().item()) + 1
@@ -1812,7 +1832,7 @@ def match_loss(
     max_iou = max_iou[valid_gt]
 
     if max_position.numel() == 0:
-        return pred_bbox.sum() * 0.0
+        return zero_loss
 
     # Rows là reference proposal tốt nhất của từng GT.
     pos_pair1, pos_pair2 = same_obj[
@@ -1846,14 +1866,14 @@ def match_loss(
             * (-torch.log(pos_sims))
         ).sum()
     else:
-        pos_term = pred_bbox.sum() * 0.0
+        pos_term = zero_loss
 
     if neg_sims.numel() > 0:
         neg_term = (
             -torch.log(1 - neg_sims)
         ).sum()
     else:
-        neg_term = pred_bbox.sum() * 0.0
+        neg_term = zero_loss
 
     denom = max(
         1,
@@ -1891,6 +1911,7 @@ def validate_config(config):
         "positive_anchor_ratio",
         "rpn_positive_overlap",
         "rpn_negative_overlap",
+        "rpn_ignore_overlap",
         "rpn_bbox_normalize_targets",
         "rpn_smooth_l1_beta",
         "ignore_label",
@@ -1930,6 +1951,17 @@ def validate_config(config):
             "config.num_cell_anchors không khớp số "
             "ratio × scale."
         )
+
+    if int(config.backbone_freeze_at) < 0:
+        raise ValueError("backbone_freeze_at must be >= 0")
+    if not 0.0 <= float(config.rpn_ignore_overlap) <= 1.0:
+        raise ValueError("rpn_ignore_overlap must be in [0, 1]")
+    if not 0.0 <= float(config.rpn_negative_overlap) <= 1.0:
+        raise ValueError("rpn_negative_overlap must be in [0, 1]")
+    if not 0.0 <= float(config.rpn_positive_overlap) <= 1.0:
+        raise ValueError("rpn_positive_overlap must be in [0, 1]")
+    if float(config.rpn_negative_overlap) > float(config.rpn_positive_overlap):
+        raise ValueError("rpn_negative_overlap must be <= rpn_positive_overlap")
 
     return True
 

@@ -8,7 +8,6 @@ Huấn luyện và đánh giá 3 biến thể trên CÙNG một pipeline:
     1) baseline : Faster R-CNN
     2) odam     : Faster R-CNN + ODAM-Train
     3) dpga     : Faster R-CNN + DPGA-ODAM
-    4) rapg     : Faster R-CNN + RAPG-ODAM
 
 Yêu cầu dataset:
     COCO JSON detection format.
@@ -109,7 +108,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -161,7 +160,8 @@ class DetectorConfig:
     image_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
     # Backbone
-    backbone_freeze_at: int = 2
+    backbone_freeze_at: int = 0
+    backbone_pretrained: bool = False
 
     # Filled from dataset at runtime.
     num_classes: int = 2
@@ -185,6 +185,7 @@ class DetectorConfig:
     positive_anchor_ratio: float = 0.5
     rpn_positive_overlap: float = 0.7
     rpn_negative_overlap: float = 0.3
+    rpn_ignore_overlap: float = 0.5
 
     rpn_bbox_normalize_targets: bool = False
     rpn_smooth_l1_beta: float = 1.0 / 9.0
@@ -270,26 +271,6 @@ def reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-def reduce_sum_float(value: float, device: torch.device) -> float:
-    tensor = torch.tensor(
-        float(value),
-        device=device,
-        dtype=torch.float32,
-    )
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return float(tensor.detach().cpu())
-
-
-def proposal_weighted_reliability(
-    reliability_sum: float,
-    reliability_count: float,
-) -> float:
-    if float(reliability_count) <= 0.0:
-        return 0.0
-    return float(reliability_sum) / float(reliability_count)
-
-
 def current_git_commit() -> Optional[str]:
     try:
         result = subprocess.run(
@@ -310,7 +291,7 @@ def manual_allreduce_grads(model: nn.Module):
     """
     Legacy helper for code paths that manually assign final gradients.
 
-    DPGA/RAPG must not call this after DPGAController.backward(), because the
+    DPGA must not call this after DPGAController.backward(), because the
     controller already averages raw detection and ODAM gradients before applying
     nonlinear gradient surgery.
     """
@@ -901,7 +882,7 @@ def _odam_quality_enabled(args) -> bool:
     configured = getattr(args, "eval_odam_quality", None)
     if configured is not None:
         return bool(configured)
-    return getattr(args, "method", None) in ("odam", "dpga", "rapg")
+    return getattr(args, "method", None) in ("odam", "dpga")
 
 
 def _dam_energy_in_box(
@@ -1267,16 +1248,14 @@ DPGA_ABLATION_PRESETS = {
 
 AUX_SAFETY_EPS = 1e-8
 METRICS_SCHEMA_VERSION = 2
-PROPOSAL_STATS_SCHEMA_VERSION = 2
 GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 3
-RAPG_RELIABILITY_AGGREGATION = "proposal_weighted_global_mean"
 
 
 def apply_dpga_ablation_preset(args):
-    if args.method not in ("dpga", "rapg"):
+    if args.method != "dpga":
         if args.dpga_ablation != "full":
             raise ValueError(
-                "--dpga-ablation is only valid with --method dpga/rapg."
+                "--dpga-ablation is only valid with --method dpga."
             )
         args.dpga_ablation_label = args.method
         return args
@@ -1289,17 +1268,7 @@ def apply_dpga_ablation_preset(args):
     args.dpga_projection = bool(preset["projection"])
     args.dpga_norm_cap = bool(preset["norm_cap"])
     args.dpga_gate = bool(preset["gate"])
-    args.dpga_ablation_label = (
-        "F_rapg"
-        if args.method == "rapg" and args.dpga_ablation == "full"
-        else str(preset["label"])
-    )
-    if args.method == "rapg":
-        if args.rapg_rampup_epochs is not None:
-            args.dpga_rampup = int(args.rapg_rampup_epochs)
-        args.dpga_warmup = int(
-            round(float(args.epochs) * float(args.rapg_warmup_ratio))
-        )
+    args.dpga_ablation_label = str(preset["label"])
     return args
 
 
@@ -1389,9 +1358,9 @@ def build_scheduler(optimizer, args):
 def load_initial_weights(
     model: nn.Module,
     checkpoint_path: Optional[str],
-):
+) -> bool:
     if not checkpoint_path:
-        return
+        return False
 
     checkpoint = torch.load(
         checkpoint_path,
@@ -1403,15 +1372,81 @@ def load_initial_weights(
     else:
         state = checkpoint
 
+    if not isinstance(state, dict):
+        raise TypeError(
+            f"Checkpoint {checkpoint_path} does not contain a state_dict."
+        )
+
+    raw_model = unwrap_model(model)
+    model_state = raw_model.state_dict()
+    loadable_state = {}
+    skipped_shape = []
+    for key, value in state.items():
+        normalized_key = key[7:] if key.startswith("module.") else key
+        if normalized_key not in model_state:
+            continue
+        if not torch.is_tensor(value):
+            continue
+        if tuple(value.shape) != tuple(model_state[normalized_key].shape):
+            skipped_shape.append((normalized_key, tuple(value.shape), tuple(model_state[normalized_key].shape)))
+            continue
+        loadable_state[normalized_key] = value
+
+    matched = len(loadable_state)
+    total = len(model_state)
+    match_ratio = matched / max(total, 1)
+    if matched == 0 or match_ratio < 0.50:
+        raise RuntimeError(
+            "Checkpoint is incompatible with this model: "
+            f"matched_tensors={matched}/{total} "
+            f"match_ratio={match_ratio:.3f} path={checkpoint_path}"
+        )
+
     missing, unexpected = unwrap_model(model).load_state_dict(
-        state,
+        loadable_state,
         strict=False,
     )
 
+    unexpected = [
+        key for key in state
+        if (key[7:] if key.startswith("module.") else key) not in model_state
+    ]
     print(
         f"[init] loaded {checkpoint_path}; "
-        f"missing={len(missing)}, unexpected={len(unexpected)}"
+        f"matched_tensors={matched}/{total} "
+        f"match_ratio={match_ratio:.3f} "
+        f"missing={len(missing)}, unexpected={len(unexpected)}, "
+        f"shape_mismatch={len(skipped_shape)}"
     )
+    if missing:
+        print("[init] missing sample: " + ", ".join(missing[:10]))
+    if unexpected:
+        print("[init] unexpected sample: " + ", ".join(unexpected[:10]))
+    if skipped_shape:
+        sample = [
+            f"{name}: checkpoint{src} != model{dst}"
+            for name, src, dst in skipped_shape[:5]
+        ]
+        print("[init] shape mismatch sample: " + "; ".join(sample))
+    return True
+
+
+def apply_backbone_freeze_policy(
+    model: nn.Module,
+    detector_config: DetectorConfig,
+    checkpoint_loaded: bool,
+):
+    freeze_at = int(detector_config.backbone_freeze_at)
+    if freeze_at <= 0:
+        return
+    if not detector_config.backbone_pretrained and not checkpoint_loaded:
+        raise RuntimeError(
+            "Refusing to freeze a randomly initialized backbone. Use "
+            "--backbone-pretrained, provide --init-checkpoint, or set "
+            "--backbone-freeze-at 0."
+        )
+    unwrap_model(model).freeze_backbone(freeze_at)
+    print(f"[init] froze backbone stages up to {freeze_at}")
 
 
 def save_checkpoint(
@@ -1571,41 +1606,6 @@ def should_log_step(args, step: int, total_steps: int) -> bool:
     )
 
 
-def should_log_proposal_stats(args, step: int) -> bool:
-    interval = int(getattr(args, "proposal_log_interval", 0))
-    return (
-        args.method == "rapg"
-        and interval > 0
-        and step % interval == 0
-    )
-
-
-def current_rapg_stats(model: nn.Module) -> Dict[str, float]:
-    raw_model = unwrap_model(model)
-    stats = getattr(raw_model.RCNN, "last_rapg_stats", None)
-    if not stats:
-        return {
-            "num_candidate": 0.0,
-            "num_positive": 0.0,
-            "num_reliable": 0.0,
-            "reliability_sum": 0.0,
-            "reliability_count": 0.0,
-            "reliable_ratio": 0.0,
-            "mean_iou": 0.0,
-            "mean_score": 0.0,
-            "same_pairs": 0.0,
-            "negative_pairs": 0.0,
-            "mean_pair_quality": 0.0,
-            "empty_pair": 1.0,
-            "batch_reliability": 0.0,
-            "fallback": 1.0,
-        }
-    return {
-        key: float(value)
-        for key, value in stats.items()
-    }
-
-
 def format_train_step_log(
     args,
     epoch: int,
@@ -1662,25 +1662,13 @@ def train_one_epoch(
 
     raw_model = unwrap_model(model)
 
-    raw_model.set_rapg_enabled(args.method == "rapg")
-
     totals = {
         "loss_det": 0.0,
         "loss_odam": 0.0,
         "raw_loss_sum": 0.0,
-        # Backward-compatible CSV alias. For DPGA/RAPG this is a logging scalar,
+        # Backward-compatible CSV alias. For DPGA this is a logging scalar,
         # not the scalar objective whose backward pass produced the update.
         "loss_total_objective": 0.0,
-        "rapg_reliable_ratio": 0.0,
-        "rapg_batch_reliability": 0.0,
-        "rapg_empty_pair_rate": 0.0,
-        "rapg_fallback_rate": 0.0,
-        "aux_scale_local": 0.0,
-        "aux_scale_global": 0.0,
-        "num_reliable_local": 0.0,
-        "num_reliable_global": 0.0,
-        "reliability_sum_local": 0.0,
-        "reliability_sum_global": 0.0,
     }
 
     num_steps = 0
@@ -1714,24 +1702,16 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         diagnostic_rows = []
         dpga_stats = None
-        aux_scale_local = 0.0
-        aux_scale_global = 0.0
-        reliability_sum_local = 0.0
-        reliability_sum_global = 0.0
-        reliability_count_local = 0.0
-        reliability_count_global = 0.0
         dpga_epoch = float(epoch)
-        if args.method in ("dpga", "rapg") and dpga is not None:
+        if args.method == "dpga" and dpga is not None:
             dpga_epoch = float(epoch) + (
                 float(step) / max(float(total_steps), 1.0)
             )
             raw_model.set_odam_enabled(dpga.alpha(dpga_epoch) > 0.0)
         else:
             raw_model.set_odam_enabled(args.method == "odam")
-        if args.method == "rapg":
-            raw_model.RCNN.last_rapg_stats = None
 
-        if args.method in ("dpga", "rapg") and isinstance(model, DDP):
+        if args.method == "dpga" and isinstance(model, DDP):
             sync_context = model.no_sync()
         else:
             sync_context = nullcontext()
@@ -1783,47 +1763,14 @@ def train_one_epoch(
                     )
                 backward_objective.backward()
 
-            elif args.method in ("dpga", "rapg"):
+            elif args.method == "dpga":
                 if dpga is None:
-                    raise RuntimeError("DPGA/RAPG controller not initialized")
-
-                rapg_stats = current_rapg_stats(model)
-                aux_scale_local = (
-                    float(rapg_stats["batch_reliability"])
-                    if args.method == "rapg"
-                    else 1.0
-                )
-                if args.method == "rapg":
-                    reliability_sum_local = float(
-                        rapg_stats["reliability_sum"]
-                    )
-                    reliability_count_local = float(
-                        rapg_stats["reliability_count"]
-                    )
-                    reliability_sum_global = reduce_sum_float(
-                        reliability_sum_local,
-                        device,
-                    )
-                    reliability_count_global = reduce_sum_float(
-                        reliability_count_local,
-                        device,
-                    )
-                    aux_scale_global = proposal_weighted_reliability(
-                        reliability_sum_global,
-                        reliability_count_global,
-                    )
-                else:
-                    reliability_sum_local = aux_scale_local
-                    reliability_sum_global = aux_scale_local
-                    reliability_count_local = 1.0
-                    reliability_count_global = 1.0
-                    aux_scale_global = aux_scale_local
+                    raise RuntimeError("DPGA controller not initialized")
 
                 dpga_stats = dpga.backward(
                     loss_det=loss_det,
                     loss_odam=loss_odam,
                     epoch=dpga_epoch,
-                    aux_scale=aux_scale_global,
                 )
 
                 # For logging only; NOT used as the DPGA backward objective.
@@ -1837,12 +1784,6 @@ def train_one_epoch(
                         step=step,
                         rank=rank,
                         method=args.method,
-                        aux_scale_local=aux_scale_local,
-                        aux_scale_global=aux_scale_global,
-                        reliability_sum_local=reliability_sum_local,
-                        reliability_sum_global=reliability_sum_global,
-                        reliability_count_local=reliability_count_local,
-                        reliability_count_global=reliability_count_global,
                     )
 
             else:
@@ -1891,26 +1832,6 @@ def train_one_epoch(
             diagnostic_rows,
             rank,
         )
-        rapg_stats = current_rapg_stats(model)
-        if should_log_proposal_stats(args, step):
-            append_proposal_stats(
-                output_dir,
-                {
-                    "epoch": epoch,
-                    "step": step,
-                    "rank": rank,
-                    "method": args.method,
-                    "aux_scale_local": aux_scale_local,
-                    "aux_scale_global": aux_scale_global,
-                    "reliability_sum_local": reliability_sum_local,
-                    "reliability_sum_global": reliability_sum_global,
-                    "num_reliable_local": reliability_count_local,
-                    "num_reliable_global": reliability_count_global,
-                    "reliability_aggregation": RAPG_RELIABILITY_AGGREGATION,
-                    **rapg_stats,
-                },
-                rank,
-            )
 
         loss_det_reduced = reduce_mean(
             loss_det.detach()
@@ -1934,26 +1855,6 @@ def train_one_epoch(
         totals["loss_total_objective"] += float(
             raw_loss_sum_reduced.cpu()
         )
-        if args.method == "rapg":
-            totals["rapg_reliable_ratio"] += float(
-                rapg_stats["reliable_ratio"]
-            )
-            totals["rapg_batch_reliability"] += float(
-                rapg_stats["batch_reliability"]
-            )
-            totals["rapg_empty_pair_rate"] += float(
-                rapg_stats["empty_pair"]
-            )
-            totals["rapg_fallback_rate"] += float(
-                rapg_stats["fallback"]
-            )
-        if args.method in ("dpga", "rapg"):
-            totals["aux_scale_local"] += float(aux_scale_local)
-            totals["aux_scale_global"] += float(aux_scale_global)
-            totals["num_reliable_local"] += float(reliability_count_local)
-            totals["num_reliable_global"] += float(reliability_count_global)
-            totals["reliability_sum_local"] += float(reliability_sum_local)
-            totals["reliability_sum_global"] += float(reliability_sum_global)
         num_steps += 1
 
         loss_det_value = float(loss_det_reduced.cpu())
@@ -1999,13 +1900,6 @@ def train_one_epoch(
             and step % args.dpga_log_interval == 0
         ):
             print(format_dpga_stats(dpga_stats))
-        if (
-            rank == 0
-            and args.method == "rapg"
-            and args.dpga_log_interval > 0
-            and step % args.dpga_log_interval == 0
-        ):
-            print(format_dpga_stats(dpga_stats))
 
     denom = max(num_steps, 1)
 
@@ -2037,45 +1931,6 @@ CSV_FIELDS = [
     "ODAM_quality",
     "ODAM_quality_samples",
     "ODAM_quality_mean_iou",
-    "rapg_reliable_ratio",
-    "rapg_batch_reliability",
-    "rapg_empty_pair_rate",
-    "rapg_fallback_rate",
-    "aux_scale_local",
-    "aux_scale_global",
-    "num_reliable_local",
-    "num_reliable_global",
-    "reliability_sum_local",
-    "reliability_sum_global",
-]
-
-
-PROPOSAL_STATS_FIELDS = [
-    "epoch",
-    "step",
-    "rank",
-    "method",
-    "num_candidate",
-    "num_positive",
-    "num_reliable",
-    "num_reliable_local",
-    "num_reliable_global",
-    "reliability_sum",
-    "reliability_count",
-    "reliability_sum_local",
-    "reliability_sum_global",
-    "reliability_aggregation",
-    "reliable_ratio",
-    "mean_iou",
-    "mean_score",
-    "same_pairs",
-    "negative_pairs",
-    "mean_pair_quality",
-    "empty_pair",
-    "batch_reliability",
-    "fallback",
-    "aux_scale_local",
-    "aux_scale_global",
 ]
 
 
@@ -2089,15 +1944,6 @@ GRADIENT_DIAGNOSTIC_FIELDS = [
     "loss_odam",
     "gradient_scope",
     "world_size",
-    "base_alpha",
-    "aux_scale",
-    "aux_scale_local",
-    "aux_scale_global",
-    "num_reliable_local",
-    "num_reliable_global",
-    "reliability_sum_local",
-    "reliability_sum_global",
-    "reliability_aggregation",
     "cosine_raw",
     "det_norm",
     "det_gradient_norm",
@@ -2191,23 +2037,10 @@ def append_csv(
     )
 
 
-def append_proposal_stats(
-    output_dir: Path,
-    row: Dict,
-    rank: int,
-):
-    csv_path = output_dir / f"proposal_stats_rank{rank}.csv"
-    append_csv_fields(
-        csv_path,
-        row,
-        PROPOSAL_STATS_FIELDS,
-    )
-
-
 def should_log_gradient_diagnostics(args, step: int) -> bool:
     interval = int(args.gradient_diagnostics_interval)
     return (
-        args.method in ("odam", "dpga", "rapg")
+        args.method in ("odam", "dpga")
         and interval > 0
         and step % interval == 0
     )
@@ -2369,15 +2202,6 @@ def compute_odam_gradient_diagnostics(
                 "loss_odam": float(loss_odam.detach().cpu()),
                 "gradient_scope": gradient_scope,
                 "world_size": world_size,
-                "base_alpha": float(odam_weight),
-                "aux_scale": 1.0,
-                "aux_scale_local": 1.0,
-                "aux_scale_global": 1.0,
-                "num_reliable_local": "",
-                "num_reliable_global": "",
-                "reliability_sum_local": "",
-                "reliability_sum_global": "",
-                "reliability_aggregation": "",
                 "cosine_raw": cosine_raw,
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
@@ -2428,12 +2252,6 @@ def dpga_stats_to_diagnostic_rows(
     step: int,
     rank: int,
     method: str = "dpga",
-    aux_scale_local: float = 1.0,
-    aux_scale_global: float = 1.0,
-    reliability_sum_local: float = 0.0,
-    reliability_sum_global: float = 0.0,
-    reliability_count_local: float = 0.0,
-    reliability_count_global: float = 0.0,
 ) -> List[Dict]:
     rows = []
 
@@ -2500,23 +2318,6 @@ def dpga_stats_to_diagnostic_rows(
                 "loss_odam": float(loss_odam.detach().cpu()),
                 "gradient_scope": getattr(stats, "gradient_scope", "local"),
                 "world_size": getattr(stats, "world_size", current_world_size()),
-                "base_alpha": getattr(
-                    stats,
-                    "base_alpha",
-                    float(module_stats.alpha),
-                ),
-                "aux_scale": getattr(stats, "aux_scale", 1.0),
-                "aux_scale_local": float(aux_scale_local),
-                "aux_scale_global": float(aux_scale_global),
-                "num_reliable_local": float(reliability_count_local),
-                "num_reliable_global": float(reliability_count_global),
-                "reliability_sum_local": float(reliability_sum_local),
-                "reliability_sum_global": float(reliability_sum_global),
-                "reliability_aggregation": (
-                    RAPG_RELIABILITY_AGGREGATION
-                    if method == "rapg"
-                    else ""
-                ),
                 "cosine_raw": float(module_stats.cosine_before),
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
@@ -2582,7 +2383,7 @@ def parse_args():
 
     parser.add_argument(
         "--method",
-        choices=("baseline", "odam", "dpga", "rapg"),
+        choices=("baseline", "odam", "dpga"),
         required=True,
     )
 
@@ -2643,48 +2444,35 @@ def parse_args():
         default=None,
         help="Same initialization checkpoint should be used for all 3 methods.",
     )
+    parser.add_argument(
+        "--backbone-pretrained",
+        action="store_true",
+        help="Initialize ResNet-50 from torchvision pretrained weights.",
+    )
+    parser.add_argument(
+        "--backbone-freeze-at",
+        type=int,
+        default=0,
+        help=(
+            "Freeze backbone stages after pretrained/checkpoint weights are "
+            "available. 0 means no freeze; 1 freezes stem; 2 freezes stem+layer1."
+        ),
+    )
+    parser.add_argument(
+        "--rpn-ignore-overlap",
+        type=float,
+        default=0.5,
+        help=(
+            "Anchor IoA threshold for marking anchors that overlap ignore/crowd "
+            "regions as ignore instead of background."
+        ),
+    )
 
     # Original ODAM scalarization
     parser.add_argument(
         "--odam-weight",
         type=float,
         default=0.2,
-    )
-
-    # RAPG reliability-aware proposal selection
-    parser.add_argument("--rapg-min-iou", type=float, default=0.7)
-    parser.add_argument("--rapg-min-score", type=float, default=0.9)
-    parser.add_argument("--rapg-topk-per-gt", type=int, default=2)
-    parser.add_argument("--rapg-min-reliable", type=int, default=2)
-    parser.add_argument(
-        "--rapg-negative-iou-threshold",
-        type=float,
-        default=0.1,
-    )
-    parser.add_argument(
-        "--rapg-allow-wrong-class",
-        dest="rapg_require_correct_class",
-        action="store_false",
-        help="Do not require predicted class to match the assigned GT class.",
-    )
-    parser.set_defaults(rapg_require_correct_class=True)
-    parser.add_argument(
-        "--rapg-warmup-ratio",
-        type=float,
-        default=0.33,
-        help="For --method rapg, overrides --dpga-warmup as round(epochs * ratio).",
-    )
-    parser.add_argument(
-        "--rapg-rampup-epochs",
-        type=int,
-        default=5,
-        help="For --method rapg, overrides --dpga-rampup.",
-    )
-    parser.add_argument(
-        "--proposal-log-interval",
-        type=int,
-        default=100,
-        help="Write RAPG proposal_stats_rank*.csv every N steps. Set 0 to disable.",
     )
 
     # DPGA schedule
@@ -2826,6 +2614,20 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    if args.odam_weight < 0:
+        raise ValueError("--odam-weight must be >= 0")
+    if args.dpga_warmup < 0:
+        raise ValueError("--dpga-warmup must be >= 0")
+    if args.dpga_rampup < 0:
+        raise ValueError("--dpga-rampup must be >= 0")
+    if args.dpga_alpha < 0:
+        raise ValueError("--dpga-alpha must be >= 0")
+    if args.dpga_temperature <= 0:
+        raise ValueError("--dpga-temperature must be > 0")
+    if args.backbone_freeze_at < 0:
+        raise ValueError("--backbone-freeze-at must be >= 0")
+    if not 0.0 <= args.rpn_ignore_overlap <= 1.0:
+        raise ValueError("--rpn-ignore-overlap must be in [0, 1]")
     return apply_dpga_ablation_preset(args)
 
 
@@ -2937,15 +2739,23 @@ def main():
     config = DetectorConfig(
         num_classes=len(train_dataset.category_ids) + 1,
         train_batch_per_gpu=args.batch_size,
+        backbone_freeze_at=args.backbone_freeze_at,
+        backbone_pretrained=args.backbone_pretrained,
+        rpn_ignore_overlap=args.rpn_ignore_overlap,
     )
     validate_config(config)
 
     model = Network(config)
     model.to(device)
 
-    load_initial_weights(
+    checkpoint_loaded = load_initial_weights(
         model,
         args.init_checkpoint,
+    )
+    apply_backbone_freeze_policy(
+        model,
+        config,
+        checkpoint_loaded=checkpoint_loaded,
     )
 
     if distributed:
@@ -2958,20 +2768,11 @@ def main():
 
     raw_model = unwrap_model(model)
 
-    # train_one_epoch enables DPGA/RAPG ODAM only after alpha becomes positive.
+    # train_one_epoch enables DPGA ODAM only after alpha becomes positive.
     raw_model.set_odam_enabled(
         args.method == "odam"
     )
     raw_model.set_odam_inference(False)
-    raw_model.set_rapg_enabled(args.method == "rapg")
-    raw_model.set_rapg_config(
-        rapg_min_iou=args.rapg_min_iou,
-        rapg_min_score=args.rapg_min_score,
-        rapg_topk_per_gt=args.rapg_topk_per_gt,
-        rapg_min_reliable=args.rapg_min_reliable,
-        rapg_negative_iou_threshold=args.rapg_negative_iou_threshold,
-        rapg_require_correct_class=args.rapg_require_correct_class,
-    )
 
     optimizer = build_optimizer(
         model,
@@ -2983,7 +2784,7 @@ def main():
     )
 
     dpga = None
-    if args.method in ("dpga", "rapg"):
+    if args.method == "dpga":
         dpga = DPGAController(
             raw_model,
             make_dpga_config(args),
@@ -3009,48 +2810,32 @@ def main():
             "args": vars(args),
             "git_commit": current_git_commit(),
             "metrics_schema_version": METRICS_SCHEMA_VERSION,
-            "proposal_stats_schema_version": PROPOSAL_STATS_SCHEMA_VERSION,
             "gradient_diagnostic_schema_version": (
                 GRADIENT_DIAGNOSTIC_SCHEMA_VERSION
             ),
             "dpga_gradient_pipeline": (
                 "raw_detection_and_odam_gradients_are_allreduced_before_dpga"
-                if args.method in ("dpga", "rapg")
+                if args.method == "dpga"
                 else None
             ),
             "odam_pair_identity": (
                 "image_aware_batch_id_gt_id"
-                if args.method in ("odam", "dpga", "rapg")
+                if args.method in ("odam", "dpga")
                 else None
             ),
             "odam_pair_scope": (
-                "same_image_only"
-                if args.method in ("odam", "dpga", "rapg")
-                else None
-            ),
-            "rapg_min_reliable_scope": (
-                "per_image_object_after_topk"
-                if args.method == "rapg"
-                else None
-            ),
-            "rapg_aux_scale_scope": (
-                RAPG_RELIABILITY_AGGREGATION
-                if args.method == "rapg"
-                else None
-            ),
-            "rapg_reliability_aggregation": (
-                RAPG_RELIABILITY_AGGREGATION
-                if args.method == "rapg"
+                "same_image_only_self_pairs_excluded"
+                if args.method in ("odam", "dpga")
                 else None
             ),
             "dpga_warmup_semantics": (
                 "odam_forward_disabled_when_alpha_is_zero"
-                if args.method in ("dpga", "rapg")
+                if args.method == "dpga"
                 else None
             ),
             "dpga_alpha_timebase": (
                 "fractional_epoch"
-                if args.method in ("dpga", "rapg")
+                if args.method == "dpga"
                 else None
             ),
             "metric_note": (
@@ -3080,7 +2865,7 @@ def main():
             f"lr_steps={list(args.lr_steps)} "
             f"output={output_dir}"
         )
-        if args.method in ("dpga", "rapg"):
+        if args.method == "dpga":
             print(
                 "[setup-dpga] "
                 f"ablation={args.dpga_ablation_label} "
@@ -3098,18 +2883,6 @@ def main():
                 f"rho_roi_cls={args.rho_roi_cls} "
                 f"rho_roi_reg={args.rho_roi_reg}"
             )
-        if args.method == "rapg":
-            print(
-                "[setup-rapg] "
-                f"min_iou={args.rapg_min_iou} "
-                f"min_score={args.rapg_min_score} "
-                f"topk_per_gt={args.rapg_topk_per_gt} "
-                f"min_reliable={args.rapg_min_reliable} "
-                f"negative_iou_threshold={args.rapg_negative_iou_threshold} "
-                f"require_correct_class={int(args.rapg_require_correct_class)} "
-                f"warmup_ratio={args.rapg_warmup_ratio}"
-            )
-
     best_value = (
         float("inf")
         if args.best_metric == "MR-2_generic"
