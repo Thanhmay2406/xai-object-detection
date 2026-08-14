@@ -1153,6 +1153,7 @@ class RCNN(nn.Module):
         fg_masks: torch.Tensor,
         fg_gt_classes: torch.Tensor,
         assigned_gts_fg: torch.Tensor,
+        fg_batch_ids: torch.Tensor,
         pred_gt_ious: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
         device = pred_cls.device
@@ -1188,16 +1189,21 @@ class RCNN(nn.Module):
 
         keep = torch.zeros_like(reliable)
         topk = max(int(self.rapg_topk_per_gt), 1)
-        for gt_id in torch.unique(assigned_gts_fg[reliable]):
+        min_reliable = max(int(self.rapg_min_reliable), 1)
+        object_ids = image_aware_object_ids(
+            assigned_gts_fg,
+            fg_batch_ids,
+        )
+        for object_id in torch.unique(object_ids[reliable]):
             candidates = torch.nonzero(
-                reliable & (assigned_gts_fg == gt_id),
+                reliable & (object_ids == object_id),
                 as_tuple=False,
             ).squeeze(1)
-            if candidates.numel() == 0:
-                continue
             if candidates.numel() > topk:
                 scores = reliability_score[candidates]
                 candidates = candidates[torch.argsort(scores, descending=True)[:topk]]
+            if candidates.numel() < min_reliable:
+                continue
             keep[candidates] = True
 
         reliable_count = int(keep.sum().detach().cpu())
@@ -1206,7 +1212,7 @@ class RCNN(nn.Module):
             return keep, reliability_score, stats
 
         kept_quality = reliability_score[keep]
-        kept_objs = assigned_gts_fg[keep]
+        kept_objs = object_ids[keep]
         reliability_sum = float(kept_quality.sum().detach().cpu())
         same_pairs = 0
         for gt_id in torch.unique(kept_objs):
@@ -1226,9 +1232,9 @@ class RCNN(nn.Module):
             "same_pairs": float(same_pairs),
             "negative_pairs": 0.0,
             "mean_pair_quality": batch_reliability,
-            "empty_pair": float(reliable_count < int(self.rapg_min_reliable)),
+            "empty_pair": 0.0,
             "batch_reliability": batch_reliability,
-            "fallback": float(reliable_count < int(self.rapg_min_reliable)),
+            "fallback": 0.0,
         }
         return keep, reliability_score, stats
 
@@ -1368,6 +1374,7 @@ class RCNN(nn.Module):
             # ODAM gradients
             fg_inds = fg_masks.nonzero(as_tuple=True)[0]
             assigned_gts_fg = assigned_gts[fg_masks]
+            fg_batch_ids = rcnn_rois[fg_masks, 0].long()
             selected_local = torch.ones_like(fg_gt_classes, dtype=torch.bool)
             rapg_quality = None
 
@@ -1378,18 +1385,13 @@ class RCNN(nn.Module):
                         fg_masks=fg_masks,
                         fg_gt_classes=fg_gt_classes,
                         assigned_gts_fg=assigned_gts_fg,
+                        fg_batch_ids=fg_batch_ids,
                         pred_gt_ious=pred_gt_ious,
                     )
                 )
                 rapg_quality = rapg_quality_all[selected_local]
                 self.last_rapg_stats = rapg_stats
-                if (
-                    int(selected_local.sum().detach().cpu())
-                    < int(self.rapg_min_reliable)
-                ):
-                    self.last_rapg_stats["batch_reliability"] = 0.0
-                    self.last_rapg_stats["reliability_sum"] = 0.0
-                    self.last_rapg_stats["reliability_count"] = 0.0
+                if int(selected_local.sum().detach().cpu()) <= 0:
                     self.last_rapg_stats["fallback"] = 1.0
                     return {
                         "loss_rcnn_loc": loss_rcnn_loc,
@@ -1433,39 +1435,30 @@ class RCNN(nn.Module):
             )
 
             assigned_gts_selected = assigned_gts_fg[selected_local]
+            batch_ids_selected = fg_batch_ids[selected_local]
             pred_bbox_selected = pred_bbox[selected_local]
             pred_gt_ious_selected = pred_gt_ious[selected_local]
 
             if self.rapg_enabled and self.last_rapg_stats is not None:
                 with torch.no_grad():
-                    pair_iou = box_overlap_opr(
+                    same_obj, neg_mask, _ = image_aware_pair_masks(
+                        assigned_gts_selected,
+                        batch_ids_selected,
                         pred_bbox_selected,
-                        pred_bbox_selected,
+                        negative_iou_threshold=float(
+                            self.rapg_negative_iou_threshold
+                        ),
+                        include_self_pairs=False,
                     )
-                    same_obj = (
-                        assigned_gts_selected[:, None]
-                        == assigned_gts_selected[None, :]
-                    )
-                    not_self = ~torch.eye(
-                        assigned_gts_selected.numel(),
-                        dtype=torch.bool,
-                        device=assigned_gts_selected.device,
-                    )
-                    same_pairs = int((same_obj & not_self).sum().detach().cpu())
+                    same_pairs = int(same_obj.sum().detach().cpu())
                     negative_pairs = int(
-                        (
-                            (pair_iou > float(self.rapg_negative_iou_threshold))
-                            & (~same_obj)
-                        ).sum().detach().cpu()
+                        neg_mask.sum().detach().cpu()
                     )
                     empty_pair = same_pairs + negative_pairs <= 0
                     self.last_rapg_stats["same_pairs"] = float(same_pairs)
                     self.last_rapg_stats["negative_pairs"] = float(negative_pairs)
                     self.last_rapg_stats["empty_pair"] = float(empty_pair)
                     if empty_pair:
-                        self.last_rapg_stats["batch_reliability"] = 0.0
-                        self.last_rapg_stats["reliability_sum"] = 0.0
-                        self.last_rapg_stats["reliability_count"] = 0.0
                         self.last_rapg_stats["fallback"] = 1.0
                         return {
                             "loss_rcnn_loc": loss_rcnn_loc,
@@ -1476,6 +1469,7 @@ class RCNN(nn.Module):
             loss_rcnn_match = match_loss(
                 pred_dams,
                 assigned_gts_selected,
+                batch_ids_selected,
                 pred_bbox_selected,
                 pred_gt_ious_selected,
                 proposal_quality=rapg_quality,
@@ -1879,11 +1873,91 @@ def roi_align_inv(pool_dams, rois, scale, map_size):
 # ODAM matching loss
 # =============================================================================
 
+def image_aware_object_ids(
+    gt_ids: torch.Tensor,
+    batch_ids: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Map local GT ids to object ids unique within a multi-image batch.
+    """
+    gt_ids = gt_ids.long().flatten()
+    batch_ids = batch_ids.long().flatten()
+
+    if gt_ids.numel() != batch_ids.numel():
+        raise ValueError(
+            "gt_ids and batch_ids must have the same number of elements"
+        )
+
+    if gt_ids.numel() == 0:
+        return gt_ids.new_zeros((0,), dtype=torch.long)
+
+    object_keys = torch.stack(
+        (batch_ids, gt_ids),
+        dim=1,
+    )
+    _, object_ids = torch.unique(
+        object_keys,
+        dim=0,
+        return_inverse=True,
+    )
+    return object_ids.long()
+
+
+def image_aware_pair_masks(
+    gt_ids: torch.Tensor,
+    batch_ids: torch.Tensor,
+    pred_bbox: torch.Tensor,
+    negative_iou_threshold: float = 0.0,
+    include_self_pairs: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build ODAM pair masks without crossing image boundaries.
+
+    Returns:
+        same_obj: same image and same (batch_id, gt_id) object.
+        neg_mask: same image, overlapping boxes, different object.
+        object_ids: compact ids for (batch_id, gt_id).
+    """
+    gt_ids = gt_ids.long().flatten()
+    batch_ids = batch_ids.long().flatten()
+
+    if gt_ids.numel() != batch_ids.numel():
+        raise ValueError(
+            "gt_ids and batch_ids must have the same number of elements"
+        )
+
+    object_ids = image_aware_object_ids(gt_ids, batch_ids)
+    M = int(gt_ids.numel())
+    same_image = batch_ids[:, None] == batch_ids[None, :]
+    same_obj = same_image & (
+        object_ids[:, None] == object_ids[None, :]
+    )
+
+    if not include_self_pairs:
+        same_obj = same_obj & (
+            ~torch.eye(
+                M,
+                dtype=torch.bool,
+                device=gt_ids.device,
+            )
+        )
+
+    pred_paired_iou = box_overlap_opr(
+        pred_bbox,
+        pred_bbox,
+    )
+    overlap_mask = pred_paired_iou > float(negative_iou_threshold)
+    neg_mask = same_image & overlap_mask & (~same_obj)
+
+    return same_obj, neg_mask, object_ids
+
+
 def match_loss(
     dams,
     objs,
-    pred_bbox,
-    pred_gt_iou,
+    batch_ids_or_pred_bbox,
+    pred_bbox=None,
+    pred_gt_iou=None,
     proposal_quality: Optional[torch.Tensor] = None,
     negative_iou_threshold: float = 0.0,
     include_self_pairs: bool = True,
@@ -1893,23 +1967,47 @@ def match_loss(
         prediction thuộc cùng GT -> DAM similarity -> 1
     Negative:
         prediction thuộc GT khác nhưng bbox overlap -> DAM similarity -> 0
+
+    New call signature passes batch ids explicitly:
+        match_loss(dams, gt_ids, batch_ids, pred_bbox, pred_gt_iou, ...)
+
+    Legacy single-image calls are still accepted:
+        match_loss(dams, gt_ids, pred_bbox, pred_gt_iou, ...)
     """
+    if pred_gt_iou is None:
+        if pred_bbox is None:
+            raise TypeError("pred_bbox and pred_gt_iou are required")
+        pred_gt_iou = pred_bbox
+        pred_bbox = batch_ids_or_pred_bbox
+        batch_ids = objs.new_zeros(objs.shape, dtype=torch.long)
+    else:
+        batch_ids = batch_ids_or_pred_bbox
+
     if dams.numel() == 0:
         return pred_bbox.sum() * 0.0
 
     M, _ = dams.shape
 
     objs = objs.long()
+    batch_ids = batch_ids.long()
 
     if objs.numel() == 0:
         return pred_bbox.sum() * 0.0
 
-    num_gt = int(objs.max().item()) + 1
+    same_obj, neg_mask, object_ids = image_aware_pair_masks(
+        objs,
+        batch_ids,
+        pred_bbox,
+        negative_iou_threshold=negative_iou_threshold,
+        include_self_pairs=include_self_pairs,
+    )
+
+    num_gt = int(object_ids.max().item()) + 1
 
     ious = pred_gt_iou.new_zeros((M, num_gt))
     ious[
-        torch.arange(M, device=objs.device),
-        objs,
+        torch.arange(M, device=object_ids.device),
+        object_ids,
     ] = pred_gt_iou
 
     max_iou, max_position = ious.max(dim=0)
@@ -1920,27 +2018,6 @@ def match_loss(
 
     if max_position.numel() == 0:
         return pred_bbox.sum() * 0.0
-
-    pred_paired_iou = box_overlap_opr(
-        pred_bbox,
-        pred_bbox,
-    )
-
-    overlap_mask = pred_paired_iou > float(negative_iou_threshold)
-
-    same_obj = (
-        objs[:, None] == objs[None, :]
-    )
-    if not include_self_pairs:
-        same_obj = same_obj & (
-            ~torch.eye(
-                M,
-                dtype=torch.bool,
-                device=objs.device,
-            )
-        )
-
-    neg_mask = overlap_mask & (~same_obj)
 
     # Rows là reference proposal tốt nhất của từng GT.
     pos_pair1, pos_pair2 = same_obj[

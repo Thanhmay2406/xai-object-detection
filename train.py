@@ -3000,6 +3000,9 @@ def main():
             ),
             "world_size": world_size,
             "device": str(device),
+            "train_batch_size_per_gpu": args.batch_size,
+            "effective_train_batch_size": args.batch_size * world_size,
+            "val_batch_size": args.val_batch_size,
             "categories": train_dataset.category_ids,
             "internal_label_mapping": train_dataset.cat_id_to_label,
             "detector_config": asdict(config),
@@ -3013,6 +3016,21 @@ def main():
             "dpga_gradient_pipeline": (
                 "raw_detection_and_odam_gradients_are_allreduced_before_dpga"
                 if args.method in ("dpga", "rapg")
+                else None
+            ),
+            "odam_pair_identity": (
+                "image_aware_batch_id_gt_id"
+                if args.method in ("odam", "dpga", "rapg")
+                else None
+            ),
+            "odam_pair_scope": (
+                "same_image_only"
+                if args.method in ("odam", "dpga", "rapg")
+                else None
+            ),
+            "rapg_min_reliable_scope": (
+                "per_image_object_after_topk"
+                if args.method == "rapg"
                 else None
             ),
             "rapg_aux_scale_scope": (
