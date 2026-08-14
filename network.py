@@ -21,6 +21,7 @@ Lưu ý:
 """
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -1133,6 +1134,8 @@ class RCNN(nn.Module):
             "num_candidate": float(num_positive),
             "num_positive": float(num_positive),
             "num_reliable": 0.0,
+            "reliability_sum": 0.0,
+            "reliability_count": 0.0,
             "reliable_ratio": 0.0,
             "mean_iou": 0.0,
             "mean_score": 0.0,
@@ -1204,6 +1207,7 @@ class RCNN(nn.Module):
 
         kept_quality = reliability_score[keep]
         kept_objs = assigned_gts_fg[keep]
+        reliability_sum = float(kept_quality.sum().detach().cpu())
         same_pairs = 0
         for gt_id in torch.unique(kept_objs):
             count = int((kept_objs == gt_id).sum().detach().cpu())
@@ -1214,6 +1218,8 @@ class RCNN(nn.Module):
             "num_candidate": float(num_positive),
             "num_positive": float(num_positive),
             "num_reliable": float(reliable_count),
+            "reliability_sum": reliability_sum,
+            "reliability_count": float(reliable_count),
             "reliable_ratio": float(reliable_count) / max(float(num_positive), 1.0),
             "mean_iou": float(pred_gt_ious[keep].mean().detach().cpu()),
             "mean_score": float(class_scores[keep].mean().detach().cpu()),
@@ -1381,6 +1387,10 @@ class RCNN(nn.Module):
                     int(selected_local.sum().detach().cpu())
                     < int(self.rapg_min_reliable)
                 ):
+                    self.last_rapg_stats["batch_reliability"] = 0.0
+                    self.last_rapg_stats["reliability_sum"] = 0.0
+                    self.last_rapg_stats["reliability_count"] = 0.0
+                    self.last_rapg_stats["fallback"] = 1.0
                     return {
                         "loss_rcnn_loc": loss_rcnn_loc,
                         "loss_rcnn_cls": loss_rcnn_cls,
@@ -1454,6 +1464,8 @@ class RCNN(nn.Module):
                     self.last_rapg_stats["empty_pair"] = float(empty_pair)
                     if empty_pair:
                         self.last_rapg_stats["batch_reliability"] = 0.0
+                        self.last_rapg_stats["reliability_sum"] = 0.0
+                        self.last_rapg_stats["reliability_count"] = 0.0
                         self.last_rapg_stats["fallback"] = 1.0
                         return {
                             "loss_rcnn_loc": loss_rcnn_loc,
@@ -2356,6 +2368,12 @@ def _dpga_allreduce_mean(
     return out
 
 
+def allreduce_gradient_list_mean(
+    grads: Sequence[torch.Tensor],
+) -> List[torch.Tensor]:
+    return _dpga_allreduce_mean(grads)
+
+
 # -----------------------------------------------------------------------------
 # Module grouping
 # -----------------------------------------------------------------------------
@@ -2884,7 +2902,12 @@ def dpga_training_step(
     epoch: float,
 ):
     """
-    Một training step hoàn chỉnh.
+    Deprecated convenience helper for small local DPGA smoke tests.
+
+    Use train.py for final experiments. This helper does not implement the full
+    experiment pipeline around DPGA/RAPG, including fractional-step scheduling,
+    RAPG proposal-weighted global reliability logging, artifact schema guards,
+    or method-specific ODAM warm-up toggling.
 
     Example
     -------
@@ -2909,6 +2932,13 @@ def dpga_training_step(
                     epoch,
                 )
     """
+    warnings.warn(
+        "dpga_training_step() is deprecated for experiment runs; use train.py "
+        "so DPGA/RAPG scheduling, RAPG reliability aggregation, diagnostics, "
+        "and artifact guards stay aligned.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     model.train()
     optimizer.zero_grad(set_to_none=True)
 

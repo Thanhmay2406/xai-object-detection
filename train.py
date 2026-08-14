@@ -104,6 +104,7 @@ import json
 import math
 import os
 import random
+import subprocess
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields
@@ -140,6 +141,7 @@ from network import (
     DPGAConfig,
     DPGAController,
     DPGAModulePolicy,
+    allreduce_gradient_list_mean,
     build_dpga_groups,
     format_dpga_stats,
     split_detection_and_odam_loss,
@@ -268,13 +270,40 @@ def reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-def reduce_mean_float(value: float, device: torch.device) -> float:
+def reduce_sum_float(value: float, device: torch.device) -> float:
     tensor = torch.tensor(
         float(value),
         device=device,
         dtype=torch.float32,
     )
-    return float(reduce_mean(tensor).detach().cpu())
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.detach().cpu())
+
+
+def proposal_weighted_reliability(
+    reliability_sum: float,
+    reliability_count: float,
+) -> float:
+    if float(reliability_count) <= 0.0:
+        return 0.0
+    return float(reliability_sum) / float(reliability_count)
+
+
+def current_git_commit() -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    commit = result.stdout.strip()
+    return commit or None
 
 
 def manual_allreduce_grads(model: nn.Module):
@@ -1236,6 +1265,13 @@ DPGA_ABLATION_PRESETS = {
 }
 
 
+AUX_SAFETY_EPS = 1e-8
+METRICS_SCHEMA_VERSION = 2
+PROPOSAL_STATS_SCHEMA_VERSION = 2
+GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 3
+RAPG_RELIABILITY_AGGREGATION = "proposal_weighted_global_mean"
+
+
 def apply_dpga_ablation_preset(args):
     if args.method not in ("dpga", "rapg"):
         if args.dpga_ablation != "full":
@@ -1552,6 +1588,8 @@ def current_rapg_stats(model: nn.Module) -> Dict[str, float]:
             "num_candidate": 0.0,
             "num_positive": 0.0,
             "num_reliable": 0.0,
+            "reliability_sum": 0.0,
+            "reliability_count": 0.0,
             "reliable_ratio": 0.0,
             "mean_iou": 0.0,
             "mean_score": 0.0,
@@ -1639,6 +1677,10 @@ def train_one_epoch(
         "rapg_fallback_rate": 0.0,
         "aux_scale_local": 0.0,
         "aux_scale_global": 0.0,
+        "num_reliable_local": 0.0,
+        "num_reliable_global": 0.0,
+        "reliability_sum_local": 0.0,
+        "reliability_sum_global": 0.0,
     }
 
     num_steps = 0
@@ -1674,6 +1716,10 @@ def train_one_epoch(
         dpga_stats = None
         aux_scale_local = 0.0
         aux_scale_global = 0.0
+        reliability_sum_local = 0.0
+        reliability_sum_global = 0.0
+        reliability_count_local = 0.0
+        reliability_count_global = 0.0
         dpga_epoch = float(epoch)
         if args.method in ("dpga", "rapg") and dpga is not None:
             dpga_epoch = float(epoch) + (
@@ -1747,11 +1793,31 @@ def train_one_epoch(
                     if args.method == "rapg"
                     else 1.0
                 )
-                aux_scale_global = (
-                    reduce_mean_float(aux_scale_local, device)
-                    if args.method == "rapg"
-                    else aux_scale_local
-                )
+                if args.method == "rapg":
+                    reliability_sum_local = float(
+                        rapg_stats["reliability_sum"]
+                    )
+                    reliability_count_local = float(
+                        rapg_stats["reliability_count"]
+                    )
+                    reliability_sum_global = reduce_sum_float(
+                        reliability_sum_local,
+                        device,
+                    )
+                    reliability_count_global = reduce_sum_float(
+                        reliability_count_local,
+                        device,
+                    )
+                    aux_scale_global = proposal_weighted_reliability(
+                        reliability_sum_global,
+                        reliability_count_global,
+                    )
+                else:
+                    reliability_sum_local = aux_scale_local
+                    reliability_sum_global = aux_scale_local
+                    reliability_count_local = 1.0
+                    reliability_count_global = 1.0
+                    aux_scale_global = aux_scale_local
 
                 dpga_stats = dpga.backward(
                     loss_det=loss_det,
@@ -1773,6 +1839,10 @@ def train_one_epoch(
                         method=args.method,
                         aux_scale_local=aux_scale_local,
                         aux_scale_global=aux_scale_global,
+                        reliability_sum_local=reliability_sum_local,
+                        reliability_sum_global=reliability_sum_global,
+                        reliability_count_local=reliability_count_local,
+                        reliability_count_global=reliability_count_global,
                     )
 
             else:
@@ -1832,6 +1902,11 @@ def train_one_epoch(
                     "method": args.method,
                     "aux_scale_local": aux_scale_local,
                     "aux_scale_global": aux_scale_global,
+                    "reliability_sum_local": reliability_sum_local,
+                    "reliability_sum_global": reliability_sum_global,
+                    "num_reliable_local": reliability_count_local,
+                    "num_reliable_global": reliability_count_global,
+                    "reliability_aggregation": RAPG_RELIABILITY_AGGREGATION,
                     **rapg_stats,
                 },
                 rank,
@@ -1875,6 +1950,10 @@ def train_one_epoch(
         if args.method in ("dpga", "rapg"):
             totals["aux_scale_local"] += float(aux_scale_local)
             totals["aux_scale_global"] += float(aux_scale_global)
+            totals["num_reliable_local"] += float(reliability_count_local)
+            totals["num_reliable_global"] += float(reliability_count_global)
+            totals["reliability_sum_local"] += float(reliability_sum_local)
+            totals["reliability_sum_global"] += float(reliability_sum_global)
         num_steps += 1
 
         loss_det_value = float(loss_det_reduced.cpu())
@@ -1964,6 +2043,10 @@ CSV_FIELDS = [
     "rapg_fallback_rate",
     "aux_scale_local",
     "aux_scale_global",
+    "num_reliable_local",
+    "num_reliable_global",
+    "reliability_sum_local",
+    "reliability_sum_global",
 ]
 
 
@@ -1975,6 +2058,13 @@ PROPOSAL_STATS_FIELDS = [
     "num_candidate",
     "num_positive",
     "num_reliable",
+    "num_reliable_local",
+    "num_reliable_global",
+    "reliability_sum",
+    "reliability_count",
+    "reliability_sum_local",
+    "reliability_sum_global",
+    "reliability_aggregation",
     "reliable_ratio",
     "mean_iou",
     "mean_score",
@@ -2003,6 +2093,11 @@ GRADIENT_DIAGNOSTIC_FIELDS = [
     "aux_scale",
     "aux_scale_local",
     "aux_scale_global",
+    "num_reliable_local",
+    "num_reliable_global",
+    "reliability_sum_local",
+    "reliability_sum_global",
+    "reliability_aggregation",
     "cosine_raw",
     "det_norm",
     "det_gradient_norm",
@@ -2047,7 +2142,7 @@ def append_csv_fields(
     )
 
     exists = csv_path.exists()
-    active_fields = list(fields)
+    expected_fields = list(fields)
     if exists:
         with csv_path.open(
             "r",
@@ -2056,12 +2151,17 @@ def append_csv_fields(
         ) as f:
             reader = csv.reader(f)
             existing_header = next(reader, None)
-        if existing_header:
-            active_fields = list(existing_header)
+        if existing_header != expected_fields:
+            raise RuntimeError(
+                "CSV schema mismatch for "
+                f"{csv_path}. The output directory contains artifacts from "
+                "a different code revision or schema version. Use a fresh "
+                "output directory for this run."
+            )
 
     normalized = {
         field: row.get(field, "")
-        for field in active_fields
+        for field in expected_fields
     }
 
     with csv_path.open(
@@ -2071,7 +2171,7 @@ def append_csv_fields(
     ) as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=active_fields,
+            fieldnames=expected_fields,
         )
 
         if not exists:
@@ -2202,6 +2302,13 @@ def compute_odam_gradient_diagnostics(
         params,
     )
 
+    world_size = current_world_size()
+    gradient_scope = "local"
+    if world_size > 1:
+        g_det_flat = allreduce_gradient_list_mean(g_det_flat)
+        g_odam_flat = allreduce_gradient_list_mean(g_odam_flat)
+        gradient_scope = "global_ddp_mean"
+
     rows = []
     offset = 0
 
@@ -2260,12 +2367,17 @@ def compute_odam_gradient_diagnostics(
                 "module": module_name,
                 "loss_det": float(loss_det.detach().cpu()),
                 "loss_odam": float(loss_odam.detach().cpu()),
-                "gradient_scope": "local",
-                "world_size": current_world_size(),
+                "gradient_scope": gradient_scope,
+                "world_size": world_size,
                 "base_alpha": float(odam_weight),
                 "aux_scale": 1.0,
                 "aux_scale_local": 1.0,
                 "aux_scale_global": 1.0,
+                "num_reliable_local": "",
+                "num_reliable_global": "",
+                "reliability_sum_local": "",
+                "reliability_sum_global": "",
+                "reliability_aggregation": "",
                 "cosine_raw": cosine_raw,
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
@@ -2294,8 +2406,8 @@ def compute_odam_gradient_diagnostics(
                 "conflict_raw": int(cosine_raw < 0.0),
                 "dominance_raw": int(odam_norm > det_norm),
                 "dominance_effective": int(final_odam_norm > det_norm),
-                "unsafe_descent": int(directional_margin < 0.0),
-                "aux_unsafe": int(directional_margin < 0.0),
+                "unsafe_descent": int(directional_margin < -AUX_SAFETY_EPS),
+                "aux_unsafe": int(directional_margin < -AUX_SAFETY_EPS),
                 "projected": 0,
                 "cap_active": 0,
                 "norm_scale": 1.0,
@@ -2318,6 +2430,10 @@ def dpga_stats_to_diagnostic_rows(
     method: str = "dpga",
     aux_scale_local: float = 1.0,
     aux_scale_global: float = 1.0,
+    reliability_sum_local: float = 0.0,
+    reliability_sum_global: float = 0.0,
+    reliability_count_local: float = 0.0,
+    reliability_count_global: float = 0.0,
 ) -> List[Dict]:
     rows = []
 
@@ -2392,6 +2508,15 @@ def dpga_stats_to_diagnostic_rows(
                 "aux_scale": getattr(stats, "aux_scale", 1.0),
                 "aux_scale_local": float(aux_scale_local),
                 "aux_scale_global": float(aux_scale_global),
+                "num_reliable_local": float(reliability_count_local),
+                "num_reliable_global": float(reliability_count_global),
+                "reliability_sum_local": float(reliability_sum_local),
+                "reliability_sum_global": float(reliability_sum_global),
+                "reliability_aggregation": (
+                    RAPG_RELIABILITY_AGGREGATION
+                    if method == "rapg"
+                    else ""
+                ),
                 "cosine_raw": float(module_stats.cosine_before),
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
@@ -2414,8 +2539,8 @@ def dpga_stats_to_diagnostic_rows(
                 "conflict_raw": int(module_stats.cosine_before < 0.0),
                 "dominance_raw": int(odam_norm_raw > det_norm),
                 "dominance_effective": int(effective_aux_norm > det_norm),
-                "unsafe_descent": int(directional_margin < 0.0),
-                "aux_unsafe": int(directional_margin < 0.0),
+                "unsafe_descent": int(directional_margin < -AUX_SAFETY_EPS),
+                "aux_unsafe": int(directional_margin < -AUX_SAFETY_EPS),
                 "projected": int(module_stats.projected),
                 "cap_active": int(module_stats.cap_active),
                 "norm_scale": float(module_stats.norm_scale),
@@ -2879,15 +3004,26 @@ def main():
             "internal_label_mapping": train_dataset.cat_id_to_label,
             "detector_config": asdict(config),
             "args": vars(args),
+            "git_commit": current_git_commit(),
+            "metrics_schema_version": METRICS_SCHEMA_VERSION,
+            "proposal_stats_schema_version": PROPOSAL_STATS_SCHEMA_VERSION,
+            "gradient_diagnostic_schema_version": (
+                GRADIENT_DIAGNOSTIC_SCHEMA_VERSION
+            ),
             "dpga_gradient_pipeline": (
                 "raw_detection_and_odam_gradients_are_allreduced_before_dpga"
                 if args.method in ("dpga", "rapg")
                 else None
             ),
             "rapg_aux_scale_scope": (
-                "global_ddp_mean"
-                if args.method == "rapg" and world_size > 1
-                else "local_or_single_process"
+                RAPG_RELIABILITY_AGGREGATION
+                if args.method == "rapg"
+                else None
+            ),
+            "rapg_reliability_aggregation": (
+                RAPG_RELIABILITY_AGGREGATION
+                if args.method == "rapg"
+                else None
             ),
             "dpga_warmup_semantics": (
                 "odam_forward_disabled_when_alpha_is_zero"
