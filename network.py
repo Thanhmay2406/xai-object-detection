@@ -1928,26 +1928,35 @@ def image_aware_pair_masks(
 
     object_ids = image_aware_object_ids(gt_ids, batch_ids)
     M = int(gt_ids.numel())
+    if M == 0:
+        empty = torch.zeros(
+            (0, 0),
+            dtype=torch.bool,
+            device=gt_ids.device,
+        )
+        return empty, empty, object_ids
+
     same_image = batch_ids[:, None] == batch_ids[None, :]
-    same_obj = same_image & (
+    same_object_full = same_image & (
         object_ids[:, None] == object_ids[None, :]
     )
 
+    eye = torch.eye(
+        M,
+        dtype=torch.bool,
+        device=gt_ids.device,
+    )
+
+    same_obj = same_object_full
     if not include_self_pairs:
-        same_obj = same_obj & (
-            ~torch.eye(
-                M,
-                dtype=torch.bool,
-                device=gt_ids.device,
-            )
-        )
+        same_obj = same_object_full & (~eye)
 
     pred_paired_iou = box_overlap_opr(
         pred_bbox,
         pred_bbox,
     )
     overlap_mask = pred_paired_iou > float(negative_iou_threshold)
-    neg_mask = same_image & overlap_mask & (~same_obj)
+    neg_mask = same_image & overlap_mask & (~same_object_full) & (~eye)
 
     return same_obj, neg_mask, object_ids
 
