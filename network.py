@@ -941,15 +941,17 @@ def fpn_roi_target(config, rpn_rois, im_info, gt_boxes, top_k=1):
         assignment = torch.where(ignore_assign, assign_ignore, assign_normal)
 
         labels_raw = gt[assignment, 4].long()
+        is_ignore_assignment = labels_raw == int(config.ignore_label)
 
         fg = (
             (max_overlap >= float(config.fg_threshold))
-            & (labels_raw != int(config.ignore_label))
+            & (~is_ignore_assignment)
         )
 
         bg = (
             (max_overlap < float(config.bg_threshold_high))
             & (max_overlap >= float(config.bg_threshold_low))
+            & (~is_ignore_assignment)
         )
 
         max_fg = int(round(float(config.num_rois) * float(config.fg_ratio)))
@@ -960,12 +962,16 @@ def fpn_roi_target(config, rpn_rois, im_info, gt_boxes, top_k=1):
 
         keep = torch.cat((fg_inds, bg_inds), dim=0)
 
-        # Nếu vì ngưỡng quá chặt không có ROI, giữ vài proposal làm background.
-        if keep.numel() == 0 and all_rois.shape[0] > 0:
-            fallback = min(int(config.num_rois), all_rois.shape[0])
-            keep = torch.randperm(
-                all_rois.shape[0], device=all_rois.device
-            )[:fallback]
+        if keep.numel() == 0:
+            return_rois.append(all_rois.new_zeros((0, 5)))
+            return_labels.append(
+                torch.zeros((0,), dtype=torch.long, device=all_rois.device)
+            )
+            return_bbox_targets.append(all_rois.new_zeros((0, 4)))
+            return_gt_assignments.append(
+                torch.zeros((0,), dtype=torch.long, device=all_rois.device)
+            )
+            continue
 
         rois = all_rois[keep]
         assignments = assignment[keep]
@@ -1731,7 +1737,7 @@ def image_aware_pair_masks(
     batch_ids: torch.Tensor,
     pred_bbox: torch.Tensor,
     negative_iou_threshold: float = 0.0,
-    include_self_pairs: bool = False,
+    include_self_pairs: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build ODAM pair masks without crossing image boundaries.
@@ -1814,7 +1820,7 @@ def match_loss(
         gt_ids,
         batch_ids,
         pred_bbox,
-        include_self_pairs=False,
+        include_self_pairs=True,
     )
 
     num_gt = int(object_ids.max().item()) + 1
@@ -1952,8 +1958,8 @@ def validate_config(config):
             "ratio × scale."
         )
 
-    if int(config.backbone_freeze_at) < 0:
-        raise ValueError("backbone_freeze_at must be >= 0")
+    if int(config.backbone_freeze_at) not in (0, 1, 2):
+        raise ValueError("backbone_freeze_at must be one of {0, 1, 2}")
     if not 0.0 <= float(config.rpn_ignore_overlap) <= 1.0:
         raise ValueError("rpn_ignore_overlap must be in [0, 1]")
     if not 0.0 <= float(config.rpn_negative_overlap) <= 1.0:

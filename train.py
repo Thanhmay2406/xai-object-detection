@@ -108,7 +108,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from PIL import Image
@@ -214,6 +214,24 @@ class DetectorConfig:
 
     # Per-process batch size; set from CLI.
     train_batch_per_gpu: int = 1
+
+
+@dataclass(frozen=True)
+class CheckpointLoadResult:
+    loaded_keys: Set[str]
+    missing_keys: List[str]
+    unexpected_keys: List[str]
+    shape_mismatch_keys: List[str]
+    matched_tensor_count: int
+    total_tensor_count: int
+
+    @property
+    def loaded(self) -> bool:
+        return self.matched_tensor_count > 0
+
+    @property
+    def match_ratio(self) -> float:
+        return self.matched_tensor_count / max(self.total_tensor_count, 1)
 
 
 # =============================================================================
@@ -1358,9 +1376,19 @@ def build_scheduler(optimizer, args):
 def load_initial_weights(
     model: nn.Module,
     checkpoint_path: Optional[str],
-) -> bool:
+) -> CheckpointLoadResult:
+    raw_model = unwrap_model(model)
+    model_state = raw_model.state_dict()
+
     if not checkpoint_path:
-        return False
+        return CheckpointLoadResult(
+            loaded_keys=set(),
+            missing_keys=list(model_state.keys()),
+            unexpected_keys=[],
+            shape_mismatch_keys=[],
+            matched_tensor_count=0,
+            total_tensor_count=len(model_state),
+        )
 
     checkpoint = torch.load(
         checkpoint_path,
@@ -1377,8 +1405,6 @@ def load_initial_weights(
             f"Checkpoint {checkpoint_path} does not contain a state_dict."
         )
 
-    raw_model = unwrap_model(model)
-    model_state = raw_model.state_dict()
     loadable_state = {}
     skipped_shape = []
     for key, value in state.items():
@@ -1388,7 +1414,13 @@ def load_initial_weights(
         if not torch.is_tensor(value):
             continue
         if tuple(value.shape) != tuple(model_state[normalized_key].shape):
-            skipped_shape.append((normalized_key, tuple(value.shape), tuple(model_state[normalized_key].shape)))
+            skipped_shape.append(
+                (
+                    normalized_key,
+                    tuple(value.shape),
+                    tuple(model_state[normalized_key].shape),
+                )
+            )
             continue
         loadable_state[normalized_key] = value
 
@@ -1402,7 +1434,7 @@ def load_initial_weights(
             f"match_ratio={match_ratio:.3f} path={checkpoint_path}"
         )
 
-    missing, unexpected = unwrap_model(model).load_state_dict(
+    missing, _ = unwrap_model(model).load_state_dict(
         loadable_state,
         strict=False,
     )
@@ -1428,23 +1460,76 @@ def load_initial_weights(
             for name, src, dst in skipped_shape[:5]
         ]
         print("[init] shape mismatch sample: " + "; ".join(sample))
-    return True
+    return CheckpointLoadResult(
+        loaded_keys=set(loadable_state.keys()),
+        missing_keys=list(missing),
+        unexpected_keys=list(unexpected),
+        shape_mismatch_keys=[name for name, _, _ in skipped_shape],
+        matched_tensor_count=matched,
+        total_tensor_count=total,
+    )
+
+
+def _backbone_freeze_prefixes(freeze_at: int) -> List[str]:
+    freeze_at = int(freeze_at)
+    if freeze_at not in (0, 1, 2):
+        raise ValueError("backbone_freeze_at must be one of {0, 1, 2}")
+
+    prefixes: List[str] = []
+    if freeze_at >= 1:
+        prefixes.extend(
+            [
+                "resnet50.conv1.",
+                "resnet50.bn1.",
+            ]
+        )
+    if freeze_at >= 2:
+        prefixes.append("resnet50.layer1.")
+    return prefixes
+
+
+def _required_backbone_state_keys(
+    model: nn.Module,
+    freeze_at: int,
+) -> List[str]:
+    prefixes = _backbone_freeze_prefixes(freeze_at)
+    model_state = unwrap_model(model).state_dict()
+    return sorted(
+        key for key in model_state
+        if any(key.startswith(prefix) for prefix in prefixes)
+    )
 
 
 def apply_backbone_freeze_policy(
     model: nn.Module,
     detector_config: DetectorConfig,
-    checkpoint_loaded: bool,
+    checkpoint_result: CheckpointLoadResult,
 ):
     freeze_at = int(detector_config.backbone_freeze_at)
+    if freeze_at not in (0, 1, 2):
+        raise ValueError("backbone_freeze_at must be one of {0, 1, 2}")
     if freeze_at <= 0:
         return
-    if not detector_config.backbone_pretrained and not checkpoint_loaded:
+
+    if not detector_config.backbone_pretrained:
+        required_keys = _required_backbone_state_keys(model, freeze_at)
+        missing_required = [
+            key for key in required_keys
+            if key not in checkpoint_result.loaded_keys
+        ]
+    else:
+        missing_required = []
+
+    if missing_required:
+        sample = ", ".join(missing_required[:10])
         raise RuntimeError(
-            "Refusing to freeze a randomly initialized backbone. Use "
-            "--backbone-pretrained, provide --init-checkpoint, or set "
-            "--backbone-freeze-at 0."
+            "Refusing to freeze a randomly initialized backbone stage: "
+            f"freeze_at={freeze_at} missing_checkpoint_keys="
+            f"{len(missing_required)} sample=[{sample}]. Use "
+            "--backbone-pretrained, provide a checkpoint that covers the "
+            "frozen backbone stages, or set --backbone-freeze-at 0."
         )
+
     unwrap_model(model).freeze_backbone(freeze_at)
     print(f"[init] froze backbone stages up to {freeze_at}")
 
@@ -2624,8 +2709,8 @@ def parse_args():
         raise ValueError("--dpga-alpha must be >= 0")
     if args.dpga_temperature <= 0:
         raise ValueError("--dpga-temperature must be > 0")
-    if args.backbone_freeze_at < 0:
-        raise ValueError("--backbone-freeze-at must be >= 0")
+    if args.backbone_freeze_at not in (0, 1, 2):
+        raise ValueError("--backbone-freeze-at must be one of {0, 1, 2}")
     if not 0.0 <= args.rpn_ignore_overlap <= 1.0:
         raise ValueError("--rpn-ignore-overlap must be in [0, 1]")
     return apply_dpga_ablation_preset(args)
@@ -2748,14 +2833,14 @@ def main():
     model = Network(config)
     model.to(device)
 
-    checkpoint_loaded = load_initial_weights(
+    checkpoint_result = load_initial_weights(
         model,
         args.init_checkpoint,
     )
     apply_backbone_freeze_policy(
         model,
         config,
-        checkpoint_loaded=checkpoint_loaded,
+        checkpoint_result=checkpoint_result,
     )
 
     if distributed:

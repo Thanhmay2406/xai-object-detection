@@ -1,1 +1,28 @@
-nghiên cứu về phương pháp cải thiện ODAM-train trên mô hình Faster R-CNN
+Research code for Faster R-CNN, ODAM, and DPGA-ODAM on COCO-format detection datasets.
+
+Supported training methods:
+
+```bash
+python train.py --method baseline ...
+python train.py --method odam --odam-weight 0.2 ...
+python train.py --method dpga --dpga-warmup 4 --dpga-rampup 4 ...
+```
+
+Backbone safety:
+
+- By default the ResNet-50 backbone is randomly initialized and not frozen.
+- Use `--backbone-pretrained` when you want torchvision pretrained ResNet-50 weights.
+- `--backbone-freeze-at` accepts only `0`, `1`, or `2`.
+- Use `--backbone-freeze-at N` only with pretrained weights or a compatible `--init-checkpoint`; the runner verifies the exact frozen-stage keys were loaded and fails closed rather than freezing random layers.
+
+Dataset notes:
+
+- Training annotations must be COCO detection JSON.
+- Annotations with `ignore=1` or `iscrowd=1` are encoded as ignore labels.
+- RPN anchors overlapping ignore/crowd regions by `--rpn-ignore-overlap` IoA are ignored, not trained as background.
+- ROI sampling also excludes ignore/crowd assignments from background fallback.
+
+ODAM/DPGA notes:
+
+- ODAM positive pair masks include self-pairs, matching canonical ODAM behavior.
+- DPGA uses the same ODAM loss definition and changes only gradient composition.
