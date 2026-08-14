@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
 from torchvision import transforms
@@ -2230,6 +2231,8 @@ class DPGAModuleStats:
 class DPGAStats:
     alpha: float
     modules: Dict[str, DPGAModuleStats]
+    gradient_scope: str = "local"
+    world_size: int = 1
 
 
 # -----------------------------------------------------------------------------
@@ -2300,6 +2303,38 @@ def _dpga_cosine(
         return dot.new_zeros(())
 
     return dot / (denom + eps)
+
+
+def _dpga_distributed_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_world_size())
+    return 1
+
+
+def _dpga_allreduce_mean(
+    grads: Sequence[torch.Tensor],
+) -> List[torch.Tensor]:
+    """
+    Average a full gradient list across DDP ranks before DPGA composition.
+
+    DPGA is nonlinear, so averaging the already-composed final gradients is not
+    equivalent to composing from globally averaged detection/ODAM gradients.
+    """
+    world_size = _dpga_distributed_world_size()
+    if world_size <= 1:
+        return [g.detach().clone() for g in grads]
+
+    out = []
+    with torch.no_grad():
+        for grad in grads:
+            synced = grad.detach().clone()
+            dist.all_reduce(
+                synced,
+                op=dist.ReduceOp.SUM,
+            )
+            synced.div_(world_size)
+            out.append(synced)
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -2719,6 +2754,7 @@ class DPGAController:
         loss_odam: torch.Tensor,
         epoch: float,
         aux_scale: float = 1.0,
+        sync_distributed: bool = True,
     ) -> DPGAStats:
         """
         Tạo final gradients và ghi vào param.grad.
@@ -2748,6 +2784,13 @@ class DPGAController:
             extract_odam=extract_odam,
         )
 
+        world_size = _dpga_distributed_world_size()
+        gradient_scope = "local"
+        if sync_distributed and world_size > 1:
+            g_det_flat = _dpga_allreduce_mean(g_det_flat)
+            g_odam_flat = _dpga_allreduce_mean(g_odam_flat)
+            gradient_scope = "global_ddp_mean"
+
         det_by_group = self._split_by_group(g_det_flat)
         odam_by_group = self._split_by_group(g_odam_flat)
 
@@ -2772,6 +2815,8 @@ class DPGAController:
         return DPGAStats(
             alpha=alpha,
             modules=stats_dict,
+            gradient_scope=gradient_scope,
+            world_size=world_size,
         )
 
 
@@ -2781,7 +2826,11 @@ class DPGAController:
 
 def format_dpga_stats(stats: DPGAStats) -> str:
     lines = [
-        f"DPGA alpha={stats.alpha:.4f}"
+        (
+            f"DPGA alpha={stats.alpha:.4f} "
+            f"scope={stats.gradient_scope} "
+            f"world_size={stats.world_size}"
+        )
     ]
 
     for name, s in stats.modules.items():

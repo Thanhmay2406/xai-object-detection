@@ -270,10 +270,11 @@ def reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 def manual_allreduce_grads(model: nn.Module):
     """
-    DPGA uses torch.autograd.grad + direct param.grad assignment.
-    Therefore DDP's normal backward all-reduce is bypassed.
+    Legacy helper for code paths that manually assign final gradients.
 
-    We explicitly average final gradients across ranks.
+    DPGA/RAPG must not call this after DPGAController.backward(), because the
+    controller already averages raw detection and ODAM gradients before applying
+    nonlinear gradient surgery.
     """
     if not (dist.is_available() and dist.is_initialized()):
         return
@@ -1566,10 +1567,10 @@ def format_train_step_log(
     lr: float,
     loss_det: float,
     loss_odam: float,
-    loss_objective: float,
+    raw_loss_sum: float,
     avg_det: float,
     avg_odam: float,
-    avg_objective: float,
+    avg_raw_loss_sum: float,
     step_seconds: float,
     elapsed_seconds: float,
     device: torch.device,
@@ -1586,10 +1587,10 @@ def format_train_step_log(
         f"lr={lr:.3e} "
         f"loss_det={loss_det:.4f} "
         f"loss_odam={loss_odam:.4f} "
-        f"loss_obj={loss_objective:.4f} "
+        f"raw_loss_sum={raw_loss_sum:.4f} "
         f"avg_det={avg_det:.4f} "
         f"avg_odam={avg_odam:.4f} "
-        f"avg_obj={avg_objective:.4f} "
+        f"avg_raw_loss_sum={avg_raw_loss_sum:.4f} "
         f"step_time={step_seconds:.2f}s "
         f"elapsed={format_duration(elapsed_seconds)} "
         f"eta={format_duration(eta_seconds)} "
@@ -1614,12 +1615,14 @@ def train_one_epoch(
 
     raw_model = unwrap_model(model)
 
-    raw_model.set_odam_enabled(args.method != "baseline")
     raw_model.set_rapg_enabled(args.method == "rapg")
 
     totals = {
         "loss_det": 0.0,
         "loss_odam": 0.0,
+        "raw_loss_sum": 0.0,
+        # Backward-compatible CSV alias. For DPGA/RAPG this is a logging scalar,
+        # not the scalar objective whose backward pass produced the update.
         "loss_total_objective": 0.0,
         "rapg_reliable_ratio": 0.0,
         "rapg_batch_reliability": 0.0,
@@ -1658,6 +1661,16 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         diagnostic_rows = []
         dpga_stats = None
+        dpga_epoch = float(epoch)
+        if args.method in ("dpga", "rapg") and dpga is not None:
+            dpga_epoch = float(epoch) + (
+                float(step) / max(float(total_steps), 1.0)
+            )
+            raw_model.set_odam_enabled(dpga.alpha(dpga_epoch) > 0.0)
+        else:
+            raw_model.set_odam_enabled(args.method == "odam")
+        if args.method == "rapg":
+            raw_model.RCNN.last_rapg_stats = None
 
         if args.method in ("dpga", "rapg") and isinstance(model, DDP):
             sync_context = model.no_sync()
@@ -1689,14 +1702,16 @@ def train_one_epoch(
                 )
 
             if args.method == "baseline":
-                objective = loss_det
-                objective.backward()
+                backward_objective = loss_det
+                raw_loss_sum = loss_det
+                backward_objective.backward()
 
             elif args.method == "odam":
-                objective = (
+                backward_objective = (
                     loss_det
                     + args.odam_weight * loss_odam
                 )
+                raw_loss_sum = backward_objective
                 if should_log_gradient_diagnostics(args, step):
                     diagnostic_rows = compute_odam_gradient_diagnostics(
                         model=model,
@@ -1707,7 +1722,7 @@ def train_one_epoch(
                         step=step,
                         rank=rank,
                     )
-                objective.backward()
+                backward_objective.backward()
 
             elif args.method in ("dpga", "rapg"):
                 if dpga is None:
@@ -1723,12 +1738,12 @@ def train_one_epoch(
                 dpga_stats = dpga.backward(
                     loss_det=loss_det,
                     loss_odam=loss_odam,
-                    epoch=float(epoch),
+                    epoch=dpga_epoch,
                     aux_scale=aux_scale,
                 )
 
-                # For logging only; NOT used for backward.
-                objective = loss_det + loss_odam
+                # For logging only; NOT used as the DPGA backward objective.
+                raw_loss_sum = loss_det + loss_odam
                 if should_log_gradient_diagnostics(args, step):
                     diagnostic_rows = dpga_stats_to_diagnostic_rows(
                         stats=dpga_stats,
@@ -1750,13 +1765,10 @@ def train_one_epoch(
                 step=step,
                 rank=rank,
                 method=args.method,
-                tensors={"objective": objective},
+                tensors={"raw_loss_sum": raw_loss_sum},
                 model=model,
                 check_grads=True,
             )
-
-        if args.method in ("dpga", "rapg"):
-            manual_allreduce_grads(model)
 
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -1809,8 +1821,8 @@ def train_one_epoch(
         loss_odam_reduced = reduce_mean(
             loss_odam.detach()
         )
-        objective_reduced = reduce_mean(
-            objective.detach()
+        raw_loss_sum_reduced = reduce_mean(
+            raw_loss_sum.detach()
         )
 
         totals["loss_det"] += float(
@@ -1819,8 +1831,11 @@ def train_one_epoch(
         totals["loss_odam"] += float(
             loss_odam_reduced.cpu()
         )
+        totals["raw_loss_sum"] += float(
+            raw_loss_sum_reduced.cpu()
+        )
         totals["loss_total_objective"] += float(
-            objective_reduced.cpu()
+            raw_loss_sum_reduced.cpu()
         )
         if args.method == "rapg":
             totals["rapg_reliable_ratio"] += float(
@@ -1839,16 +1854,16 @@ def train_one_epoch(
 
         loss_det_value = float(loss_det_reduced.cpu())
         loss_odam_value = float(loss_odam_reduced.cpu())
-        objective_value = float(objective_reduced.cpu())
+        raw_loss_sum_value = float(raw_loss_sum_reduced.cpu())
         avg_det = totals["loss_det"] / max(num_steps, 1)
         avg_odam = totals["loss_odam"] / max(num_steps, 1)
-        avg_objective = totals["loss_total_objective"] / max(num_steps, 1)
+        avg_raw_loss_sum = totals["raw_loss_sum"] / max(num_steps, 1)
 
         if rank == 0 and tqdm is not None:
             iterator.set_postfix(
                 det=f"{loss_det_value:.3f}",
                 odam=f"{loss_odam_value:.3f}",
-                obj=f"{objective_value:.3f}",
+                raw=f"{raw_loss_sum_value:.3f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
 
@@ -1863,10 +1878,10 @@ def train_one_epoch(
                     lr=optimizer.param_groups[0]["lr"],
                     loss_det=loss_det_value,
                     loss_odam=loss_odam_value,
-                    loss_objective=objective_value,
+                    raw_loss_sum=raw_loss_sum_value,
                     avg_det=avg_det,
                     avg_odam=avg_odam,
-                    avg_objective=avg_objective,
+                    avg_raw_loss_sum=avg_raw_loss_sum,
                     step_seconds=time.time() - step_start,
                     elapsed_seconds=time.time() - epoch_start,
                     device=device,
@@ -1903,6 +1918,7 @@ CSV_FIELDS = [
     "seconds",
     "loss_det",
     "loss_odam",
+    "raw_loss_sum",
     "loss_total_objective",
     "AP",
     "AP50",
@@ -1952,6 +1968,8 @@ GRADIENT_DIAGNOSTIC_FIELDS = [
     "module",
     "loss_det",
     "loss_odam",
+    "gradient_scope",
+    "world_size",
     "cosine_raw",
     "det_norm",
     "det_gradient_norm",
@@ -1993,10 +2011,21 @@ def append_csv_fields(
     )
 
     exists = csv_path.exists()
+    active_fields = list(fields)
+    if exists:
+        with csv_path.open(
+            "r",
+            newline="",
+            encoding="utf-8",
+        ) as f:
+            reader = csv.reader(f)
+            existing_header = next(reader, None)
+        if existing_header:
+            active_fields = list(existing_header)
 
     normalized = {
         field: row.get(field, "")
-        for field in fields
+        for field in active_fields
     }
 
     with csv_path.open(
@@ -2006,7 +2035,7 @@ def append_csv_fields(
     ) as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=fields,
+            fieldnames=active_fields,
         )
 
         if not exists:
@@ -2153,14 +2182,20 @@ def compute_odam_gradient_diagnostics(
             gd + float(odam_weight) * go
             for gd, go in zip(g_det, g_odam)
         ]
+        auxiliary_grads = [
+            float(odam_weight) * go
+            for go in g_odam
+        ]
         final_norm_t = _tensor_list_norm(final_grads)
         final_dot_t = _tensor_list_dot(g_det, final_grads)
+        auxiliary_dot_t = _tensor_list_dot(g_det, auxiliary_grads)
 
         det_norm = float(det_norm_t.detach().cpu())
         odam_norm = float(odam_norm_t.detach().cpu())
         dot = float(dot_t.detach().cpu())
         final_norm = float(final_norm_t.detach().cpu())
         final_dot = float(final_dot_t.detach().cpu())
+        auxiliary_dot = float(auxiliary_dot_t.detach().cpu())
         final_odam_norm = abs(float(odam_weight)) * odam_norm
 
         cosine_raw = _safe_ratio(
@@ -2172,7 +2207,7 @@ def compute_odam_gradient_diagnostics(
             det_norm * final_norm,
         )
         directional_margin = _safe_ratio(
-            final_dot,
+            auxiliary_dot,
             det_norm * det_norm,
         )
 
@@ -2185,6 +2220,8 @@ def compute_odam_gradient_diagnostics(
                 "module": module_name,
                 "loss_det": float(loss_det.detach().cpu()),
                 "loss_odam": float(loss_odam.detach().cpu()),
+                "gradient_scope": "local",
+                "world_size": current_world_size(),
                 "cosine_raw": cosine_raw,
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
@@ -2211,7 +2248,7 @@ def compute_odam_gradient_diagnostics(
                 "conflict_raw": int(cosine_raw < 0.0),
                 "dominance_raw": int(odam_norm > det_norm),
                 "dominance_effective": int(final_odam_norm > det_norm),
-                "unsafe_descent": int(directional_margin <= 0.0),
+                "unsafe_descent": int(directional_margin < 0.0),
                 "projected": 0,
                 "cap_active": 0,
                 "norm_scale": 1.0,
@@ -2268,8 +2305,14 @@ def dpga_stats_to_diagnostic_rows(
             * det_norm
             * odam_norm_safe
         )
+        auxiliary_dot = (
+            float(module_stats.effective_weight)
+            * float(module_stats.cosine_after)
+            * det_norm
+            * odam_norm_safe
+        )
         directional_margin = _safe_ratio(
-            final_dot,
+            auxiliary_dot,
             det_norm * det_norm,
         )
         final_cosine = _safe_ratio(
@@ -2286,6 +2329,8 @@ def dpga_stats_to_diagnostic_rows(
                 "module": module_name,
                 "loss_det": float(loss_det.detach().cpu()),
                 "loss_odam": float(loss_odam.detach().cpu()),
+                "gradient_scope": getattr(stats, "gradient_scope", "local"),
+                "world_size": getattr(stats, "world_size", current_world_size()),
                 "cosine_raw": float(module_stats.cosine_before),
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
@@ -2306,7 +2351,7 @@ def dpga_stats_to_diagnostic_rows(
                 "conflict_raw": int(module_stats.cosine_before < 0.0),
                 "dominance_raw": int(odam_norm_raw > det_norm),
                 "dominance_effective": int(effective_aux_norm > det_norm),
-                "unsafe_descent": int(directional_margin <= 0.0),
+                "unsafe_descent": int(directional_margin < 0.0),
                 "projected": int(module_stats.projected),
                 "cap_active": int(module_stats.cap_active),
                 "norm_scale": float(module_stats.norm_scale),
@@ -2910,7 +2955,7 @@ def main():
                 f"seconds={format_duration(elapsed)} "
                 f"det_loss={train_metrics['loss_det']:.4f} "
                 f"odam_loss={train_metrics['loss_odam']:.4f} "
-                f"objective={train_metrics['loss_total_objective']:.4f}"
+                f"raw_loss_sum={train_metrics['raw_loss_sum']:.4f}"
             )
 
             if val_metrics:
