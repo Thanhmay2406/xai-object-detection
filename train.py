@@ -268,6 +268,15 @@ def reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def reduce_mean_float(value: float, device: torch.device) -> float:
+    tensor = torch.tensor(
+        float(value),
+        device=device,
+        dtype=torch.float32,
+    )
+    return float(reduce_mean(tensor).detach().cpu())
+
+
 def manual_allreduce_grads(model: nn.Module):
     """
     Legacy helper for code paths that manually assign final gradients.
@@ -1628,6 +1637,8 @@ def train_one_epoch(
         "rapg_batch_reliability": 0.0,
         "rapg_empty_pair_rate": 0.0,
         "rapg_fallback_rate": 0.0,
+        "aux_scale_local": 0.0,
+        "aux_scale_global": 0.0,
     }
 
     num_steps = 0
@@ -1661,6 +1672,8 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         diagnostic_rows = []
         dpga_stats = None
+        aux_scale_local = 0.0
+        aux_scale_global = 0.0
         dpga_epoch = float(epoch)
         if args.method in ("dpga", "rapg") and dpga is not None:
             dpga_epoch = float(epoch) + (
@@ -1729,17 +1742,22 @@ def train_one_epoch(
                     raise RuntimeError("DPGA/RAPG controller not initialized")
 
                 rapg_stats = current_rapg_stats(model)
-                aux_scale = (
+                aux_scale_local = (
                     float(rapg_stats["batch_reliability"])
                     if args.method == "rapg"
                     else 1.0
+                )
+                aux_scale_global = (
+                    reduce_mean_float(aux_scale_local, device)
+                    if args.method == "rapg"
+                    else aux_scale_local
                 )
 
                 dpga_stats = dpga.backward(
                     loss_det=loss_det,
                     loss_odam=loss_odam,
                     epoch=dpga_epoch,
-                    aux_scale=aux_scale,
+                    aux_scale=aux_scale_global,
                 )
 
                 # For logging only; NOT used as the DPGA backward objective.
@@ -1753,6 +1771,8 @@ def train_one_epoch(
                         step=step,
                         rank=rank,
                         method=args.method,
+                        aux_scale_local=aux_scale_local,
+                        aux_scale_global=aux_scale_global,
                     )
 
             else:
@@ -1810,6 +1830,8 @@ def train_one_epoch(
                     "step": step,
                     "rank": rank,
                     "method": args.method,
+                    "aux_scale_local": aux_scale_local,
+                    "aux_scale_global": aux_scale_global,
                     **rapg_stats,
                 },
                 rank,
@@ -1850,6 +1872,9 @@ def train_one_epoch(
             totals["rapg_fallback_rate"] += float(
                 rapg_stats["fallback"]
             )
+        if args.method in ("dpga", "rapg"):
+            totals["aux_scale_local"] += float(aux_scale_local)
+            totals["aux_scale_global"] += float(aux_scale_global)
         num_steps += 1
 
         loss_det_value = float(loss_det_reduced.cpu())
@@ -1937,6 +1962,8 @@ CSV_FIELDS = [
     "rapg_batch_reliability",
     "rapg_empty_pair_rate",
     "rapg_fallback_rate",
+    "aux_scale_local",
+    "aux_scale_global",
 ]
 
 
@@ -1957,6 +1984,8 @@ PROPOSAL_STATS_FIELDS = [
     "empty_pair",
     "batch_reliability",
     "fallback",
+    "aux_scale_local",
+    "aux_scale_global",
 ]
 
 
@@ -1970,6 +1999,10 @@ GRADIENT_DIAGNOSTIC_FIELDS = [
     "loss_odam",
     "gradient_scope",
     "world_size",
+    "base_alpha",
+    "aux_scale",
+    "aux_scale_local",
+    "aux_scale_global",
     "cosine_raw",
     "det_norm",
     "det_gradient_norm",
@@ -1985,12 +2018,15 @@ GRADIENT_DIAGNOSTIC_FIELDS = [
     "aux_to_det_final",
     "aux_to_det_effective",
     "directional_margin",
+    "aux_directional_margin",
+    "final_alignment_margin",
     "final_cosine_to_det",
     "final_angle_deg",
     "conflict_raw",
     "dominance_raw",
     "dominance_effective",
     "unsafe_descent",
+    "aux_unsafe",
     "projected",
     "cap_active",
     "norm_scale",
@@ -2210,6 +2246,10 @@ def compute_odam_gradient_diagnostics(
             auxiliary_dot,
             det_norm * det_norm,
         )
+        final_alignment_margin = _safe_ratio(
+            final_dot,
+            det_norm * det_norm,
+        )
 
         rows.append(
             {
@@ -2222,6 +2262,10 @@ def compute_odam_gradient_diagnostics(
                 "loss_odam": float(loss_odam.detach().cpu()),
                 "gradient_scope": "local",
                 "world_size": current_world_size(),
+                "base_alpha": float(odam_weight),
+                "aux_scale": 1.0,
+                "aux_scale_local": 1.0,
+                "aux_scale_global": 1.0,
                 "cosine_raw": cosine_raw,
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
@@ -2243,12 +2287,15 @@ def compute_odam_gradient_diagnostics(
                     det_norm,
                 ),
                 "directional_margin": directional_margin,
+                "aux_directional_margin": directional_margin,
+                "final_alignment_margin": final_alignment_margin,
                 "final_cosine_to_det": final_cosine,
                 "final_angle_deg": _final_angle_degrees(final_cosine),
                 "conflict_raw": int(cosine_raw < 0.0),
                 "dominance_raw": int(odam_norm > det_norm),
                 "dominance_effective": int(final_odam_norm > det_norm),
                 "unsafe_descent": int(directional_margin < 0.0),
+                "aux_unsafe": int(directional_margin < 0.0),
                 "projected": 0,
                 "cap_active": 0,
                 "norm_scale": 1.0,
@@ -2269,6 +2316,8 @@ def dpga_stats_to_diagnostic_rows(
     step: int,
     rank: int,
     method: str = "dpga",
+    aux_scale_local: float = 1.0,
+    aux_scale_global: float = 1.0,
 ) -> List[Dict]:
     rows = []
 
@@ -2319,6 +2368,10 @@ def dpga_stats_to_diagnostic_rows(
             final_dot,
             det_norm * float(module_stats.final_norm),
         )
+        final_alignment_margin = _safe_ratio(
+            final_dot,
+            det_norm * det_norm,
+        )
 
         rows.append(
             {
@@ -2331,6 +2384,14 @@ def dpga_stats_to_diagnostic_rows(
                 "loss_odam": float(loss_odam.detach().cpu()),
                 "gradient_scope": getattr(stats, "gradient_scope", "local"),
                 "world_size": getattr(stats, "world_size", current_world_size()),
+                "base_alpha": getattr(
+                    stats,
+                    "base_alpha",
+                    float(module_stats.alpha),
+                ),
+                "aux_scale": getattr(stats, "aux_scale", 1.0),
+                "aux_scale_local": float(aux_scale_local),
+                "aux_scale_global": float(aux_scale_global),
                 "cosine_raw": float(module_stats.cosine_before),
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
@@ -2346,12 +2407,15 @@ def dpga_stats_to_diagnostic_rows(
                 "aux_to_det_final": effective_aux_ratio,
                 "aux_to_det_effective": effective_aux_ratio,
                 "directional_margin": directional_margin,
+                "aux_directional_margin": directional_margin,
+                "final_alignment_margin": final_alignment_margin,
                 "final_cosine_to_det": final_cosine,
                 "final_angle_deg": _final_angle_degrees(final_cosine),
                 "conflict_raw": int(module_stats.cosine_before < 0.0),
                 "dominance_raw": int(odam_norm_raw > det_norm),
                 "dominance_effective": int(effective_aux_norm > det_norm),
                 "unsafe_descent": int(directional_margin < 0.0),
+                "aux_unsafe": int(directional_margin < 0.0),
                 "projected": int(module_stats.projected),
                 "cap_active": int(module_stats.cap_active),
                 "norm_scale": float(module_stats.norm_scale),
@@ -2769,9 +2833,9 @@ def main():
 
     raw_model = unwrap_model(model)
 
-    # Important for a true Faster R-CNN baseline.
+    # train_one_epoch enables DPGA/RAPG ODAM only after alpha becomes positive.
     raw_model.set_odam_enabled(
-        args.method != "baseline"
+        args.method == "odam"
     )
     raw_model.set_odam_inference(False)
     raw_model.set_rapg_enabled(args.method == "rapg")
@@ -2815,6 +2879,26 @@ def main():
             "internal_label_mapping": train_dataset.cat_id_to_label,
             "detector_config": asdict(config),
             "args": vars(args),
+            "dpga_gradient_pipeline": (
+                "raw_detection_and_odam_gradients_are_allreduced_before_dpga"
+                if args.method in ("dpga", "rapg")
+                else None
+            ),
+            "rapg_aux_scale_scope": (
+                "global_ddp_mean"
+                if args.method == "rapg" and world_size > 1
+                else "local_or_single_process"
+            ),
+            "dpga_warmup_semantics": (
+                "odam_forward_disabled_when_alpha_is_zero"
+                if args.method in ("dpga", "rapg")
+                else None
+            ),
+            "dpga_alpha_timebase": (
+                "fractional_epoch"
+                if args.method in ("dpga", "rapg")
+                else None
+            ),
             "metric_note": (
                 "MR-2_generic is not the full official CityPersons "
                 "Reasonable protocol."

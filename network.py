@@ -2233,6 +2233,8 @@ class DPGAStats:
     modules: Dict[str, DPGAModuleStats]
     gradient_scope: str = "local"
     world_size: int = 1
+    base_alpha: float = 0.0
+    aux_scale: float = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -2315,25 +2317,42 @@ def _dpga_allreduce_mean(
     grads: Sequence[torch.Tensor],
 ) -> List[torch.Tensor]:
     """
-    Average a full gradient list across DDP ranks before DPGA composition.
+    Average gradient tensors across DDP ranks before DPGA composition.
 
     DPGA is nonlinear, so averaging the already-composed final gradients is not
     equivalent to composing from globally averaged detection/ODAM gradients.
+    Tensors are bucketed by device/dtype to avoid one collective per parameter.
     """
     world_size = _dpga_distributed_world_size()
+    out = [g.detach().clone() for g in grads]
     if world_size <= 1:
-        return [g.detach().clone() for g in grads]
+        return out
 
-    out = []
+    buckets: Dict[Tuple[torch.device, torch.dtype], List[int]] = {}
+    for idx, grad in enumerate(out):
+        buckets.setdefault((grad.device, grad.dtype), []).append(idx)
+
     with torch.no_grad():
-        for grad in grads:
-            synced = grad.detach().clone()
+        for indices in buckets.values():
+            if not indices:
+                continue
+            flat = torch.cat([
+                out[idx].reshape(-1)
+                for idx in indices
+            ])
             dist.all_reduce(
-                synced,
+                flat,
                 op=dist.ReduceOp.SUM,
             )
-            synced.div_(world_size)
-            out.append(synced)
+            flat.div_(world_size)
+
+            offset = 0
+            for idx in indices:
+                numel = out[idx].numel()
+                out[idx].copy_(
+                    flat[offset: offset + numel].view_as(out[idx])
+                )
+                offset += numel
     return out
 
 
@@ -2771,7 +2790,9 @@ class DPGAController:
         if loss_odam.ndim != 0:
             loss_odam = loss_odam.sum()
 
-        alpha = self.alpha(epoch) * max(float(aux_scale), 0.0)
+        base_alpha = self.alpha(epoch)
+        aux_scale = max(float(aux_scale), 0.0)
+        alpha = base_alpha * aux_scale
 
         extract_odam = (
             alpha > 0.0
@@ -2817,6 +2838,8 @@ class DPGAController:
             modules=stats_dict,
             gradient_scope=gradient_scope,
             world_size=world_size,
+            base_alpha=base_alpha,
+            aux_scale=aux_scale,
         )
 
 
@@ -2828,6 +2851,8 @@ def format_dpga_stats(stats: DPGAStats) -> str:
     lines = [
         (
             f"DPGA alpha={stats.alpha:.4f} "
+            f"base_alpha={stats.base_alpha:.4f} "
+            f"aux_scale={stats.aux_scale:.4f} "
             f"scope={stats.gradient_scope} "
             f"world_size={stats.world_size}"
         )
