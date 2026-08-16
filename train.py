@@ -3173,7 +3173,7 @@ def main():
                 else None
             ),
             "odam_pair_scope": (
-                "same_image_only_self_pairs_excluded"
+                "same_image_only_self_pairs_included"
                 if args.method in ("odam", "dpga")
                 else None
             ),
