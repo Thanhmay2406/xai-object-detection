@@ -26,6 +26,10 @@ ODAM/DPGA notes:
 
 - ODAM positive pair masks include self-pairs, matching canonical ODAM behavior.
 - DPGA uses the same ODAM loss definition and changes only gradient composition.
+- In DPGA runs, `loss_total_objective` is recorded as `NaN` because DPGA does
+  not optimize a single scalar `L_det + lambda * L_odam` objective. Use
+  `loss_proxy`, `loss_det`, `loss_odam`, `alpha`, `gate`, and gradient
+  diagnostics for DPGA reporting.
 
 Incremental ODAM/DPGA ablation:
 
@@ -59,3 +63,6 @@ python train.py --method dpga --experiment-stage E5 ...
 E2-E5 enable ODAM-only proposal quality filtering. The default thresholds are
 `--odam-min-iou 0.7` and `--odam-min-score 0.9`; filtering affects only
 proposals used to construct `loss_rcnn_match`, not detection training targets.
+
+See `experiment_commands.md` for E0-E5 command templates, environment capture,
+and the recommended pre-flight smoke checks.
