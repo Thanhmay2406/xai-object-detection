@@ -32,6 +32,9 @@ Incremental ODAM/DPGA ablation:
 Use `--experiment-stage` to run one cumulative stage at a time. E0-E2 are
 ODAM scalarization stages and should be run with `--method odam`; E3-E5 use
 DPGA gradient composition and should be run with `--method dpga`.
+In stage mode, all stages use the same maximum auxiliary ODAM weight from
+`--odam-weight`; `--dpga-alpha` is kept for legacy DPGA runs without
+`--experiment-stage`.
 
 | Stage | Warm-up | Filtering | Projection | Norm-cap | Gate |
 |------|------|------|------|------|------|

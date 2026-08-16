@@ -115,6 +115,36 @@ class ExperimentStageTest(unittest.TestCase):
         self.assertFalse(args.dpga_gate)
         self.assertEqual(args.dpga_ablation_label, "A2_projection")
 
+    def test_stage_dpga_config_uses_shared_odam_weight_for_fairness(self):
+        for stage in ("E3", "E4", "E5"):
+            with self.subTest(stage=stage):
+                args = self._parse(
+                    "--method",
+                    "dpga",
+                    "--experiment-stage",
+                    stage,
+                    "--odam-weight",
+                    "0.2",
+                    "--dpga-alpha",
+                    "1.0",
+                )
+                cfg = train.make_dpga_config(args)
+
+                self.assertAlmostEqual(cfg.alpha_max, 0.2)
+
+    def test_legacy_dpga_config_still_uses_dpga_alpha_without_stage(self):
+        args = self._parse(
+            "--method",
+            "dpga",
+            "--odam-weight",
+            "0.2",
+            "--dpga-alpha",
+            "1.0",
+        )
+        cfg = train.make_dpga_config(args)
+
+        self.assertAlmostEqual(cfg.alpha_max, 1.0)
+
     def test_e0_e1_scalar_smoke_backward(self):
         e0 = self._parse("--method", "odam", "--experiment-stage", "E0")
         e1 = self._parse("--method", "odam", "--experiment-stage", "E1")

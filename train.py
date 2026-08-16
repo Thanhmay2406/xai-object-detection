@@ -1491,10 +1491,16 @@ def make_dpga_config(args) -> DPGAConfig:
             + ", ".join(missing_fields)
         )
 
+    alpha_max = (
+        args.odam_weight
+        if args.experiment_stage is not None
+        else args.dpga_alpha
+    )
+
     return DPGAConfig(
         warmup_epochs=args.dpga_warmup,
         rampup_epochs=args.dpga_rampup,
-        alpha_max=args.dpga_alpha,
+        alpha_max=alpha_max,
         project_if_conflict=args.dpga_projection,
         use_norm_cap=args.dpga_norm_cap,
         use_gate=args.dpga_gate,
@@ -3142,6 +3148,11 @@ def main():
             "projection_enabled": bool(args.projection_enabled),
             "norm_cap_enabled": bool(args.norm_cap_enabled),
             "gate_enabled": bool(args.gate_enabled),
+            "dpga_alpha_max": (
+                dpga.config.alpha_max
+                if dpga is not None
+                else None
+            ),
             "dpga_ablation": getattr(args, "dpga_ablation", None),
             "dpga_ablation_label": getattr(
                 args,
@@ -3231,7 +3242,7 @@ def main():
                 f"ablation={args.dpga_ablation_label} "
                 f"warmup={args.dpga_warmup} "
                 f"rampup={args.dpga_rampup} "
-                f"alpha={args.dpga_alpha} "
+                f"alpha={dpga.config.alpha_max} "
                 f"projection={int(args.dpga_projection)} "
                 f"norm_cap={int(args.dpga_norm_cap)} "
                 f"gate={int(args.dpga_gate)} "
