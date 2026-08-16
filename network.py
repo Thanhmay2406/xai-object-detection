@@ -1112,6 +1112,11 @@ class RCNN(nn.Module):
         self.config = config
         self.odam_enabled = True
         self.odam_inference = False
+        self.last_odam_filter_stats = {
+            "candidates": 0,
+            "kept": 0,
+            "keep_ratio": 0.0,
+        }
 
         self.fc1 = nn.Linear(256 * 7 * 7, 1024)
         self.fc2 = nn.Linear(1024, 1024)
@@ -1145,6 +1150,11 @@ class RCNN(nn.Module):
         assigned_gts=None,
     ):
         config = self.config
+        self.last_odam_filter_stats = {
+            "candidates": 0,
+            "kept": 0,
+            "keep_ratio": 0.0,
+        }
         bbox_stds = config.bbox_normalize_stds
         bbox_means = config.bbox_normalize_means
 
@@ -1268,9 +1278,40 @@ class RCNN(nn.Module):
                 }
 
             # ODAM gradients
-            fg_inds = fg_masks.nonzero(as_tuple=True)[0]
-            assigned_gts_fg = assigned_gts[fg_masks]
-            fg_batch_ids = rcnn_rois[fg_masks, 0].long()
+            fg_inds_all = fg_masks.nonzero(as_tuple=True)[0]
+            fg_scores = F.softmax(pred_cls, dim=-1)[
+                fg_inds_all,
+                fg_gt_classes,
+            ]
+            odam_keep = odam_quality_filter_mask(
+                pred_gt_iou=pred_gt_ious,
+                class_scores=fg_scores,
+                enabled=bool(getattr(config, "odam_filtering", False)),
+                min_iou=float(getattr(config, "odam_min_iou", 0.7)),
+                min_score=float(getattr(config, "odam_min_score", 0.9)),
+            )
+            num_candidates = int(odam_keep.numel())
+            num_kept = int(odam_keep.sum().detach().cpu())
+            self.last_odam_filter_stats = {
+                "candidates": num_candidates,
+                "kept": num_kept,
+                "keep_ratio": (
+                    float(num_kept) / float(max(num_candidates, 1))
+                ),
+            }
+            if num_kept == 0:
+                return {
+                    "loss_rcnn_loc": loss_rcnn_loc,
+                    "loss_rcnn_cls": loss_rcnn_cls,
+                    "loss_rcnn_match": pred_delta.sum() * 0.0,
+                }
+
+            fg_inds = fg_inds_all[odam_keep]
+            fg_gt_classes_odam = fg_gt_classes[odam_keep]
+            assigned_gts_fg = assigned_gts[fg_masks][odam_keep]
+            fg_batch_ids = rcnn_rois[fg_masks, 0].long()[odam_keep]
+            pred_bbox_odam = pred_bbox[odam_keep]
+            pred_gt_ious_odam = pred_gt_ious[odam_keep]
             pool_grads = self.get_gradient(
                 pred_cls,
                 pool_features,
@@ -1280,7 +1321,7 @@ class RCNN(nn.Module):
                 (
                     pool_grads[
                         fg_inds,
-                        fg_gt_classes - 1,
+                        fg_gt_classes_odam - 1,
                         :, :, :
                     ]
                     * pool_features[fg_inds]
@@ -1308,8 +1349,8 @@ class RCNN(nn.Module):
                 pred_dams,
                 assigned_gts_fg,
                 fg_batch_ids,
-                pred_bbox,
-                pred_gt_ious,
+                pred_bbox_odam,
+                pred_gt_ious_odam,
             )
 
             # DPGA NOTE:
@@ -1794,6 +1835,37 @@ def image_aware_pair_masks(
     return same_obj, neg_mask, object_ids
 
 
+def odam_quality_filter_mask(
+    pred_gt_iou: torch.Tensor,
+    class_scores: torch.Tensor,
+    enabled: bool,
+    min_iou: float,
+    min_score: float,
+) -> torch.Tensor:
+    """
+    Select foreground proposals allowed to participate in ODAM loss only.
+    """
+    pred_gt_iou = pred_gt_iou.flatten()
+    class_scores = class_scores.flatten()
+
+    if pred_gt_iou.numel() != class_scores.numel():
+        raise ValueError(
+            "pred_gt_iou and class_scores must have the same number of elements"
+        )
+
+    if not enabled:
+        return torch.ones(
+            pred_gt_iou.shape,
+            dtype=torch.bool,
+            device=pred_gt_iou.device,
+        )
+
+    return (
+        (pred_gt_iou >= float(min_iou))
+        & (class_scores >= float(min_score))
+    )
+
+
 def match_loss(
     dams: torch.Tensor,
     gt_ids: torch.Tensor,
@@ -1971,6 +2043,10 @@ def validate_config(config):
         raise ValueError("rpn_positive_overlap must be in [0, 1]")
     if float(config.rpn_negative_overlap) > float(config.rpn_positive_overlap):
         raise ValueError("rpn_negative_overlap must be <= rpn_positive_overlap")
+    if not 0.0 <= float(getattr(config, "odam_min_iou", 0.7)) <= 1.0:
+        raise ValueError("odam_min_iou must be in [0, 1]")
+    if not 0.0 <= float(getattr(config, "odam_min_score", 0.9)) <= 1.0:
+        raise ValueError("odam_min_score must be in [0, 1]")
 
     return True
 

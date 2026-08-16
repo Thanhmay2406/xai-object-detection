@@ -26,3 +26,33 @@ ODAM/DPGA notes:
 
 - ODAM positive pair masks include self-pairs, matching canonical ODAM behavior.
 - DPGA uses the same ODAM loss definition and changes only gradient composition.
+
+Incremental ODAM/DPGA ablation:
+
+Use `--experiment-stage` to run one cumulative stage at a time. E0-E2 are
+ODAM scalarization stages and should be run with `--method odam`; E3-E5 use
+DPGA gradient composition and should be run with `--method dpga`.
+
+| Stage | Warm-up | Filtering | Projection | Norm-cap | Gate |
+|------|------|------|------|------|------|
+| E0 | No | No | No | No | No |
+| E1 | Yes | No | No | No | No |
+| E2 | Yes | Yes | No | No | No |
+| E3 | Yes | Yes | Yes | No | No |
+| E4 | Yes | Yes | Yes | Yes | No |
+| E5 | Yes | Yes | Yes | Yes | Yes |
+
+Example stage commands:
+
+```bash
+python train.py --method odam --experiment-stage E0 ...
+python train.py --method odam --experiment-stage E1 ...
+python train.py --method odam --experiment-stage E2 ...
+python train.py --method dpga --experiment-stage E3 ...
+python train.py --method dpga --experiment-stage E4 ...
+python train.py --method dpga --experiment-stage E5 ...
+```
+
+E2-E5 enable ODAM-only proposal quality filtering. The default thresholds are
+`--odam-min-iou 0.7` and `--odam-min-score 0.9`; filtering affects only
+proposals used to construct `loss_rcnn_match`, not detection training targets.

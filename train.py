@@ -104,6 +104,7 @@ import math
 import os
 import random
 import subprocess
+import sys
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields
@@ -211,6 +212,11 @@ class DetectorConfig:
 
     # Low threshold for COCO evaluation; postprocess NMS handles duplicates.
     pred_cls_threshold: float = 0.05
+
+    # ODAM-only proposal quality filtering.
+    odam_filtering: bool = False
+    odam_min_iou: float = 0.7
+    odam_min_score: float = 0.9
 
     # Per-process batch size; set from CLI.
     train_batch_per_gpu: int = 1
@@ -1264,9 +1270,186 @@ DPGA_ABLATION_PRESETS = {
 }
 
 
+@dataclass(frozen=True)
+class ExperimentStageConfig:
+    stage: str
+    warmup_enabled: bool
+    filtering_enabled: bool
+    projection_enabled: bool
+    norm_cap_enabled: bool
+    gate_enabled: bool
+
+    @property
+    def requires_dpga(self) -> bool:
+        return (
+            self.projection_enabled
+            or self.norm_cap_enabled
+            or self.gate_enabled
+        )
+
+
+EXPERIMENT_STAGE_PRESETS = {
+    "E0": ExperimentStageConfig(
+        "E0",
+        warmup_enabled=False,
+        filtering_enabled=False,
+        projection_enabled=False,
+        norm_cap_enabled=False,
+        gate_enabled=False,
+    ),
+    "E1": ExperimentStageConfig(
+        "E1",
+        warmup_enabled=True,
+        filtering_enabled=False,
+        projection_enabled=False,
+        norm_cap_enabled=False,
+        gate_enabled=False,
+    ),
+    "E2": ExperimentStageConfig(
+        "E2",
+        warmup_enabled=True,
+        filtering_enabled=True,
+        projection_enabled=False,
+        norm_cap_enabled=False,
+        gate_enabled=False,
+    ),
+    "E3": ExperimentStageConfig(
+        "E3",
+        warmup_enabled=True,
+        filtering_enabled=True,
+        projection_enabled=True,
+        norm_cap_enabled=False,
+        gate_enabled=False,
+    ),
+    "E4": ExperimentStageConfig(
+        "E4",
+        warmup_enabled=True,
+        filtering_enabled=True,
+        projection_enabled=True,
+        norm_cap_enabled=True,
+        gate_enabled=False,
+    ),
+    "E5": ExperimentStageConfig(
+        "E5",
+        warmup_enabled=True,
+        filtering_enabled=True,
+        projection_enabled=True,
+        norm_cap_enabled=True,
+        gate_enabled=True,
+    ),
+}
+
+
 AUX_SAFETY_EPS = 1e-8
 METRICS_SCHEMA_VERSION = 2
 GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 3
+
+
+def resolve_experiment_stage_config(stage: str) -> ExperimentStageConfig:
+    try:
+        return EXPERIMENT_STAGE_PRESETS[str(stage)]
+    except KeyError as exc:
+        raise ValueError(
+            "--experiment-stage must be one of {E0,E1,E2,E3,E4,E5}"
+        ) from exc
+
+
+def _cli_option_supplied(argv: Sequence[str], option: str) -> bool:
+    return any(arg == option or arg.startswith(option + "=") for arg in argv)
+
+
+def _odam_weight_for_epoch(args, epoch: float) -> float:
+    if not getattr(args, "warmup_enabled", False):
+        return float(args.odam_weight)
+
+    warmup_epochs = int(args.dpga_warmup)
+    rampup_epochs = int(args.dpga_rampup)
+    alpha_max = float(args.odam_weight)
+    epoch = float(epoch)
+
+    if epoch < warmup_epochs:
+        return 0.0
+    if rampup_epochs <= 0:
+        return alpha_max
+
+    progress = (epoch - float(warmup_epochs)) / float(rampup_epochs)
+    progress = min(max(progress, 0.0), 1.0)
+    return alpha_max * progress
+
+
+def apply_experiment_stage_preset(
+    args,
+    argv: Optional[Sequence[str]] = None,
+):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args.warmup_enabled = False
+    args.filtering_enabled = bool(args.odam_filtering)
+    args.projection_enabled = bool(args.dpga_projection)
+    args.norm_cap_enabled = bool(args.dpga_norm_cap)
+    args.gate_enabled = bool(args.dpga_gate)
+
+    if args.experiment_stage is None:
+        args = apply_dpga_ablation_preset(args)
+        args.projection_enabled = (
+            args.method == "dpga" and bool(args.dpga_projection)
+        )
+        args.norm_cap_enabled = (
+            args.method == "dpga" and bool(args.dpga_norm_cap)
+        )
+        args.gate_enabled = (
+            args.method == "dpga" and bool(args.dpga_gate)
+        )
+        args.warmup_enabled = (
+            args.method == "dpga"
+            and (args.dpga_warmup > 0 or args.dpga_rampup > 0)
+        )
+        args.filtering_enabled = bool(args.odam_filtering)
+        return args
+
+    for option in (
+        "--dpga-ablation",
+        "--no-dpga-projection",
+        "--no-dpga-norm-cap",
+        "--no-dpga-gate",
+    ):
+        if _cli_option_supplied(argv, option):
+            raise ValueError(
+                f"{option} cannot be combined with --experiment-stage; "
+                "the experiment stage is the ablation source of truth."
+            )
+
+    stage = resolve_experiment_stage_config(args.experiment_stage)
+    if args.method == "baseline":
+        raise ValueError("--experiment-stage is only valid for ODAM/DPGA runs.")
+    if stage.requires_dpga and args.method != "dpga":
+        raise ValueError(
+            f"--experiment-stage {stage.stage} requires --method dpga."
+        )
+    if not stage.requires_dpga and args.method != "odam":
+        raise ValueError(
+            f"--experiment-stage {stage.stage} is an ODAM stage and "
+            "requires --method odam."
+        )
+    if (
+        _cli_option_supplied(argv, "--odam-filtering")
+        and not stage.filtering_enabled
+    ):
+        raise ValueError(
+            "--odam-filtering conflicts with this --experiment-stage."
+        )
+
+    args.warmup_enabled = stage.warmup_enabled
+    args.odam_filtering = stage.filtering_enabled
+    args.filtering_enabled = stage.filtering_enabled
+    args.dpga_projection = stage.projection_enabled
+    args.dpga_norm_cap = stage.norm_cap_enabled
+    args.dpga_gate = stage.gate_enabled
+    args.projection_enabled = stage.projection_enabled
+    args.norm_cap_enabled = stage.norm_cap_enabled
+    args.gate_enabled = stage.gate_enabled
+    args.dpga_ablation = None
+    args.dpga_ablation_label = f"{stage.stage}_incremental"
+    return args
 
 
 def apply_dpga_ablation_preset(args):
@@ -1716,6 +1899,12 @@ def format_train_step_log(
         f"[train] epoch={epoch + 1}/{args.epochs} "
         f"step={completed}/{total_steps} "
         f"method={args.method} "
+        f"experiment_stage={args.experiment_stage} "
+        f"warmup={int(bool(args.warmup_enabled))} "
+        f"filtering={int(bool(args.filtering_enabled))} "
+        f"projection={int(bool(args.projection_enabled))} "
+        f"norm_cap={int(bool(args.norm_cap_enabled))} "
+        f"gate={int(bool(args.gate_enabled))} "
         f"lr={lr:.3e} "
         f"loss_det={loss_det:.4f} "
         f"loss_odam={loss_odam:.4f} "
@@ -1754,6 +1943,9 @@ def train_one_epoch(
         # Backward-compatible CSV alias. For DPGA this is a logging scalar,
         # not the scalar objective whose backward pass produced the update.
         "loss_total_objective": 0.0,
+        "odam_num_candidates": 0.0,
+        "odam_num_kept": 0.0,
+        "odam_keep_ratio": 0.0,
     }
 
     num_steps = 0
@@ -1787,14 +1979,17 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         diagnostic_rows = []
         dpga_stats = None
-        dpga_epoch = float(epoch)
+        fractional_epoch = float(epoch) + (
+            float(step) / max(float(total_steps), 1.0)
+        )
+        dpga_epoch = fractional_epoch
+        odam_weight = _odam_weight_for_epoch(args, fractional_epoch)
         if args.method == "dpga" and dpga is not None:
-            dpga_epoch = float(epoch) + (
-                float(step) / max(float(total_steps), 1.0)
-            )
             raw_model.set_odam_enabled(dpga.alpha(dpga_epoch) > 0.0)
         else:
-            raw_model.set_odam_enabled(args.method == "odam")
+            raw_model.set_odam_enabled(
+                args.method == "odam" and odam_weight > 0.0
+            )
 
         if args.method == "dpga" and isinstance(model, DDP):
             sync_context = model.no_sync()
@@ -1833,7 +2028,7 @@ def train_one_epoch(
             elif args.method == "odam":
                 backward_objective = (
                     loss_det
-                    + args.odam_weight * loss_odam
+                    + odam_weight * loss_odam
                 )
                 raw_loss_sum = backward_objective
                 if should_log_gradient_diagnostics(args, step):
@@ -1841,7 +2036,7 @@ def train_one_epoch(
                         model=model,
                         loss_det=loss_det,
                         loss_odam=loss_odam,
-                        odam_weight=args.odam_weight,
+                        odam_weight=odam_weight,
                         epoch=epoch,
                         step=step,
                         rank=rank,
@@ -1927,6 +2122,25 @@ def train_one_epoch(
         raw_loss_sum_reduced = reduce_mean(
             raw_loss_sum.detach()
         )
+        odam_filter_stats = getattr(
+            getattr(raw_model, "RCNN", None),
+            "last_odam_filter_stats",
+            {},
+        )
+        odam_num_candidates = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("candidates", 0.0))
+            )
+        )
+        odam_num_kept = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("kept", 0.0))
+            )
+        )
+        odam_keep_ratio = (
+            odam_num_kept
+            / odam_num_candidates.clamp(min=1.0)
+        )
 
         totals["loss_det"] += float(
             loss_det_reduced.cpu()
@@ -1939,6 +2153,15 @@ def train_one_epoch(
         )
         totals["loss_total_objective"] += float(
             raw_loss_sum_reduced.cpu()
+        )
+        totals["odam_num_candidates"] += float(
+            odam_num_candidates.cpu()
+        )
+        totals["odam_num_kept"] += float(
+            odam_num_kept.cpu()
+        )
+        totals["odam_keep_ratio"] += float(
+            odam_keep_ratio.cpu()
         )
         num_steps += 1
 
@@ -2003,6 +2226,9 @@ CSV_FIELDS = [
     "loss_odam",
     "raw_loss_sum",
     "loss_total_objective",
+    "odam_num_candidates",
+    "odam_num_kept",
+    "odam_keep_ratio",
     "AP",
     "AP50",
     "AP75",
@@ -2462,6 +2688,7 @@ def append_gradient_diagnostics(
 
 
 def parse_args():
+    argv = sys.argv[1:]
     parser = argparse.ArgumentParser(
         description="Train Faster R-CNN / ODAM / DPGA-ODAM"
     )
@@ -2481,6 +2708,15 @@ def parse_args():
         "--output",
         type=str,
         required=True,
+    )
+    parser.add_argument(
+        "--experiment-stage",
+        choices=tuple(EXPERIMENT_STAGE_PRESETS.keys()),
+        default=None,
+        help=(
+            "Incremental ODAM/DPGA ablation stage. E0-E2 require "
+            "--method odam; E3-E5 require --method dpga."
+        ),
     )
 
     # Image size
@@ -2559,6 +2795,16 @@ def parse_args():
         type=float,
         default=0.2,
     )
+    parser.add_argument(
+        "--odam-filtering",
+        action="store_true",
+        help=(
+            "Enable ODAM-only proposal quality filtering for legacy/manual "
+            "runs. Stage presets set this automatically."
+        ),
+    )
+    parser.add_argument("--odam-min-iou", type=float, default=0.7)
+    parser.add_argument("--odam-min-score", type=float, default=0.9)
 
     # DPGA schedule
     parser.add_argument("--dpga-warmup", type=int, default=4)
@@ -2709,11 +2955,17 @@ def parse_args():
         raise ValueError("--dpga-alpha must be >= 0")
     if args.dpga_temperature <= 0:
         raise ValueError("--dpga-temperature must be > 0")
+    if not 0.0 <= args.odam_min_iou <= 1.0:
+        raise ValueError("--odam-min-iou must be in [0, 1]")
+    if not 0.0 <= args.odam_min_score <= 1.0:
+        raise ValueError("--odam-min-score must be in [0, 1]")
     if args.backbone_freeze_at not in (0, 1, 2):
         raise ValueError("--backbone-freeze-at must be one of {0, 1, 2}")
     if not 0.0 <= args.rpn_ignore_overlap <= 1.0:
         raise ValueError("--rpn-ignore-overlap must be in [0, 1]")
-    return apply_dpga_ablation_preset(args)
+    if args.method == "baseline" and args.odam_filtering:
+        raise ValueError("--odam-filtering is only valid for ODAM/DPGA runs.")
+    return apply_experiment_stage_preset(args, argv=argv)
 
 
 # =============================================================================
@@ -2827,6 +3079,9 @@ def main():
         backbone_freeze_at=args.backbone_freeze_at,
         backbone_pretrained=args.backbone_pretrained,
         rpn_ignore_overlap=args.rpn_ignore_overlap,
+        odam_filtering=args.odam_filtering,
+        odam_min_iou=args.odam_min_iou,
+        odam_min_score=args.odam_min_score,
     )
     validate_config(config)
 
@@ -2853,9 +3108,10 @@ def main():
 
     raw_model = unwrap_model(model)
 
-    # train_one_epoch enables DPGA ODAM only after alpha becomes positive.
+    # train_one_epoch updates ODAM enablement at each fractional epoch.
     raw_model.set_odam_enabled(
         args.method == "odam"
+        and _odam_weight_for_epoch(args, 0.0) > 0.0
     )
     raw_model.set_odam_inference(False)
 
@@ -2878,6 +3134,14 @@ def main():
     if is_main_process(rank):
         experiment_meta = {
             "method": args.method,
+            "experiment_stage": args.experiment_stage,
+            "warmup_enabled": bool(args.warmup_enabled),
+            "filtering_enabled": bool(args.filtering_enabled),
+            "odam_min_iou": args.odam_min_iou,
+            "odam_min_score": args.odam_min_score,
+            "projection_enabled": bool(args.projection_enabled),
+            "norm_cap_enabled": bool(args.norm_cap_enabled),
+            "gate_enabled": bool(args.gate_enabled),
             "dpga_ablation": getattr(args, "dpga_ablation", None),
             "dpga_ablation_label": getattr(
                 args,
@@ -2939,6 +3203,7 @@ def main():
         print(
             "[setup] "
             f"method={args.method} "
+            f"experiment_stage={args.experiment_stage} "
             f"device={device} "
             f"world_size={world_size} "
             f"train_images={len(train_dataset)} "
@@ -2949,6 +3214,16 @@ def main():
             f"lr={args.lr:.3e} "
             f"lr_steps={list(args.lr_steps)} "
             f"output={output_dir}"
+        )
+        print(
+            "[setup-stage] "
+            f"warmup={int(bool(args.warmup_enabled))} "
+            f"filtering={int(bool(args.filtering_enabled))} "
+            f"min_iou={args.odam_min_iou} "
+            f"min_score={args.odam_min_score} "
+            f"projection={int(bool(args.projection_enabled))} "
+            f"norm_cap={int(bool(args.norm_cap_enabled))} "
+            f"gate={int(bool(args.gate_enabled))}"
         )
         if args.method == "dpga":
             print(
