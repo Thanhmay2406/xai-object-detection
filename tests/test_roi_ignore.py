@@ -1,6 +1,10 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 try:
+    from PIL import Image
     import torch
     import network
     import train
@@ -15,6 +19,53 @@ except ModuleNotFoundError:  # pragma: no cover - environment guard
 
 @unittest.skipUnless(HAS_DEPS, "torch and train dependencies are required")
 class ROIIgnoreRegressionTest(unittest.TestCase):
+    def test_dataset_ignore_annotation_can_use_unknown_category_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.png"
+            ann_path = root / "annotations.json"
+            Image.new("RGB", (16, 16), color=(255, 255, 255)).save(image_path)
+            ann_path.write_text(
+                json.dumps(
+                    {
+                        "images": [
+                            {
+                                "id": 1,
+                                "file_name": image_path.name,
+                                "width": 16,
+                                "height": 16,
+                            }
+                        ],
+                        "annotations": [
+                            {
+                                "id": 1,
+                                "image_id": 1,
+                                "category_id": 999,
+                                "bbox": [1, 1, 4, 4],
+                                "area": 16,
+                                "ignore": 1,
+                                "iscrowd": 1,
+                            }
+                        ],
+                        "categories": [
+                            {"id": 1, "name": "person"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            dataset = train.CocoDetectionTrainDataset(
+                str(root),
+                str(ann_path),
+                min_size=16,
+                max_size=16,
+            )
+            _, gt_boxes, _ = dataset[0]
+
+        self.assertEqual(gt_boxes.shape, (1, 5))
+        self.assertEqual(float(gt_boxes[0, 4]), -1.0)
+
     def test_foreground_background_and_ignore_are_separated(self):
         config = train.DetectorConfig(
             num_classes=2,

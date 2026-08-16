@@ -482,12 +482,12 @@ class CocoDetectionTrainDataset(Dataset):
             x2 = (x + w) * sx
             y2 = (y + h) * sy
 
-            category_id = int(ann["category_id"])
-            label = self.cat_id_to_label[category_id]
-
             # Ignore/crowd are marked -1 for ROI target policy.
             if int(ann.get("ignore", 0)) == 1 or int(ann.get("iscrowd", 0)) == 1:
                 label = -1
+            else:
+                category_id = int(ann["category_id"])
+                label = self.cat_id_to_label[category_id]
 
             gt_rows.append(
                 [x1, y1, x2, y2, float(label)]
@@ -1341,7 +1341,7 @@ EXPERIMENT_STAGE_PRESETS = {
 
 
 AUX_SAFETY_EPS = 1e-8
-METRICS_SCHEMA_VERSION = 2
+METRICS_SCHEMA_VERSION = 3
 GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 3
 
 
@@ -1946,8 +1946,7 @@ def train_one_epoch(
         "loss_det": 0.0,
         "loss_odam": 0.0,
         "raw_loss_sum": 0.0,
-        # Backward-compatible CSV alias. For DPGA this is a logging scalar,
-        # not the scalar objective whose backward pass produced the update.
+        "loss_proxy": 0.0,
         "loss_total_objective": 0.0,
         "odam_num_candidates": 0.0,
         "odam_num_kept": 0.0,
@@ -2029,6 +2028,7 @@ def train_one_epoch(
             if args.method == "baseline":
                 backward_objective = loss_det
                 raw_loss_sum = loss_det
+                scalar_objective_for_logging = backward_objective
                 backward_objective.backward()
 
             elif args.method == "odam":
@@ -2037,6 +2037,7 @@ def train_one_epoch(
                     + odam_weight * loss_odam
                 )
                 raw_loss_sum = backward_objective
+                scalar_objective_for_logging = backward_objective
                 if should_log_gradient_diagnostics(args, step):
                     diagnostic_rows = compute_odam_gradient_diagnostics(
                         model=model,
@@ -2061,6 +2062,7 @@ def train_one_epoch(
 
                 # For logging only; NOT used as the DPGA backward objective.
                 raw_loss_sum = loss_det + loss_odam
+                scalar_objective_for_logging = None
                 if should_log_gradient_diagnostics(args, step):
                     diagnostic_rows = dpga_stats_to_diagnostic_rows(
                         stats=dpga_stats,
@@ -2128,6 +2130,12 @@ def train_one_epoch(
         raw_loss_sum_reduced = reduce_mean(
             raw_loss_sum.detach()
         )
+        if scalar_objective_for_logging is not None:
+            loss_total_objective_reduced = reduce_mean(
+                scalar_objective_for_logging.detach()
+            )
+        else:
+            loss_total_objective_reduced = None
         odam_filter_stats = getattr(
             getattr(raw_model, "RCNN", None),
             "last_odam_filter_stats",
@@ -2157,9 +2165,13 @@ def train_one_epoch(
         totals["raw_loss_sum"] += float(
             raw_loss_sum_reduced.cpu()
         )
-        totals["loss_total_objective"] += float(
+        totals["loss_proxy"] += float(
             raw_loss_sum_reduced.cpu()
         )
+        if loss_total_objective_reduced is not None:
+            totals["loss_total_objective"] += float(
+                loss_total_objective_reduced.cpu()
+            )
         totals["odam_num_candidates"] += float(
             odam_num_candidates.cpu()
         )
@@ -2217,10 +2229,13 @@ def train_one_epoch(
 
     denom = max(num_steps, 1)
 
-    return {
+    metrics = {
         key: value / denom
         for key, value in totals.items()
     }
+    if args.method == "dpga":
+        metrics["loss_total_objective"] = float("nan")
+    return metrics
 
 
 CSV_FIELDS = [
@@ -2231,6 +2246,7 @@ CSV_FIELDS = [
     "loss_det",
     "loss_odam",
     "raw_loss_sum",
+    "loss_proxy",
     "loss_total_objective",
     "odam_num_candidates",
     "odam_num_kept",

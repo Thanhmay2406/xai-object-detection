@@ -1,4 +1,8 @@
+import math
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 try:
@@ -204,6 +208,84 @@ class ExperimentStageTest(unittest.TestCase):
                 self.assertTrue(torch.isfinite(final[0]).all())
                 self.assertTrue(torch.isfinite(torch.tensor(stats.gate)))
 
+    def test_tiny_train_epoch_smoke_reports_dpga_proxy_metric(self):
+        for method in ("baseline", "odam", "dpga"):
+            with self.subTest(method=method):
+                model = _TinyStageModel()
+                optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+                args = SimpleNamespace(
+                    method=method,
+                    finite_checks=True,
+                    grad_clip=0.0,
+                    batch_size=1,
+                    log_interval=0,
+                    dpga_log_interval=0,
+                    gradient_diagnostics_interval=0,
+                    dpga_warmup=0,
+                    dpga_rampup=0,
+                    odam_weight=0.2,
+                    experiment_stage="E3" if method == "dpga" else None,
+                    warmup_enabled=method in ("odam", "dpga"),
+                    filtering_enabled=method == "dpga",
+                    projection_enabled=method == "dpga",
+                    norm_cap_enabled=False,
+                    gate_enabled=False,
+                )
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    with patch.object(train, "tqdm", None):
+                        metrics = train.train_one_epoch(
+                            model=model,
+                            loader=[(
+                                torch.zeros(1, 3, 8, 8),
+                                torch.zeros(1, 6),
+                                torch.zeros(1, 1, 5),
+                                None,
+                            )],
+                            optimizer=optimizer,
+                            dpga=_TinyDPGA() if method == "dpga" else None,
+                            device=torch.device("cpu"),
+                            output_dir=Path(tmp),
+                            args=args,
+                            epoch=0,
+                            rank=0,
+                        )
+
+                    checkpoint = Path(tmp) / "tiny.pt"
+                    scheduler = torch.optim.lr_scheduler.StepLR(
+                        optimizer,
+                        step_size=1,
+                    )
+                    train.save_checkpoint(
+                        checkpoint,
+                        model,
+                        optimizer,
+                        scheduler=scheduler,
+                        epoch=0,
+                        method=args.method,
+                        detector_config=train.DetectorConfig(num_classes=2),
+                        metrics=metrics,
+                        args=args,
+                        category_ids=[1],
+                        label_to_cat_id={1: 1},
+                    )
+                    loaded = torch.load(
+                        checkpoint,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+
+                self.assertLess(float(model.weight.detach()), 1.0)
+                self.assertTrue(math.isfinite(metrics["loss_proxy"]))
+                if method == "dpga":
+                    self.assertTrue(math.isnan(metrics["loss_total_objective"]))
+                else:
+                    self.assertTrue(
+                        math.isfinite(metrics["loss_total_objective"])
+                    )
+                self.assertIn("model", loaded)
+                self.assertIn("optimizer", loaded)
+
     def _scalar_backward_is_finite(self, args, epoch):
         param = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
         loss_det = (param.square()).sum()
@@ -230,6 +312,36 @@ class ExperimentStageTest(unittest.TestCase):
         ]
         with patch("sys.argv", argv):
             return train.parse_args()
+
+
+class _TinyStageModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(1.0))
+        self.RCNN = SimpleNamespace(last_odam_filter_stats={})
+        self.odam_enabled = False
+
+    def set_odam_enabled(self, enabled):
+        self.odam_enabled = bool(enabled)
+
+    def set_odam_inference(self, enabled):
+        self.odam_inference = bool(enabled)
+
+    def forward(self, image, im_info, gt_boxes):
+        return {
+            "loss_rpn_cls": self.weight.square(),
+            "loss_rcnn_cls": self.weight * 0.0,
+            "loss_rcnn_match": self.weight,
+        }
+
+
+class _TinyDPGA:
+    def alpha(self, epoch):
+        return 1.0
+
+    def backward(self, loss_det, loss_odam, epoch):
+        (loss_det + loss_odam).backward()
+        return SimpleNamespace(modules={})
 
 
 if __name__ == "__main__":
