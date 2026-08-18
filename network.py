@@ -1116,6 +1116,18 @@ class RCNN(nn.Module):
             "candidates": 0,
             "kept": 0,
             "keep_ratio": 0.0,
+            "reliability_mean": 0.0,
+            "reliability_std": 0.0,
+            "reliability_p10": 0.0,
+            "reliability_p50": 0.0,
+            "reliability_p90": 0.0,
+            "roi_iou_mean": 0.0,
+            "roi_score_mean": 0.0,
+            "odam_loss_raw": 0.0,
+            "odam_loss_weighted": 0.0,
+            "effective_odam_rois": 0.0,
+            "low_reliability_fraction": 0.0,
+            "high_reliability_fraction": 0.0,
         }
 
         self.fc1 = nn.Linear(256 * 7 * 7, 1024)
@@ -1154,6 +1166,18 @@ class RCNN(nn.Module):
             "candidates": 0,
             "kept": 0,
             "keep_ratio": 0.0,
+            "reliability_mean": 0.0,
+            "reliability_std": 0.0,
+            "reliability_p10": 0.0,
+            "reliability_p50": 0.0,
+            "reliability_p90": 0.0,
+            "roi_iou_mean": 0.0,
+            "roi_score_mean": 0.0,
+            "odam_loss_raw": 0.0,
+            "odam_loss_weighted": 0.0,
+            "effective_odam_rois": 0.0,
+            "low_reliability_fraction": 0.0,
+            "high_reliability_fraction": 0.0,
         }
         bbox_stds = config.bbox_normalize_stds
         bbox_means = config.bbox_normalize_means
@@ -1283,6 +1307,23 @@ class RCNN(nn.Module):
                 fg_inds_all,
                 fg_gt_classes,
             ]
+            reliability_all = odam_reliability_weights(
+                pred_gt_iou=pred_gt_ious,
+                class_scores=fg_scores,
+                enabled=bool(getattr(config, "odam_reliability", False)),
+                iou_tau=float(
+                    getattr(config, "odam_reliability_iou_tau", 0.6)
+                ),
+                iou_temperature=float(
+                    getattr(config, "odam_reliability_iou_temp", 0.1)
+                ),
+                score_tau=float(
+                    getattr(config, "odam_reliability_score_tau", 0.7)
+                ),
+                score_temperature=float(
+                    getattr(config, "odam_reliability_score_temp", 0.1)
+                ),
+            )
             odam_keep = odam_quality_filter_mask(
                 pred_gt_iou=pred_gt_ious,
                 class_scores=fg_scores,
@@ -1292,11 +1333,19 @@ class RCNN(nn.Module):
             )
             num_candidates = int(odam_keep.numel())
             num_kept = int(odam_keep.sum().detach().cpu())
+            kept_reliability = reliability_all[odam_keep]
+            kept_ious = pred_gt_ious[odam_keep]
+            kept_scores = fg_scores[odam_keep]
             self.last_odam_filter_stats = {
                 "candidates": num_candidates,
                 "kept": num_kept,
                 "keep_ratio": (
                     float(num_kept) / float(max(num_candidates, 1))
+                ),
+                **odam_reliability_summary(
+                    kept_reliability,
+                    kept_ious,
+                    kept_scores,
                 ),
             }
             if num_kept == 0:
@@ -1312,6 +1361,7 @@ class RCNN(nn.Module):
             fg_batch_ids = rcnn_rois[fg_masks, 0].long()[odam_keep]
             pred_bbox_odam = pred_bbox[odam_keep]
             pred_gt_ious_odam = pred_gt_ious[odam_keep]
+            reliability_odam = kept_reliability
             pool_grads = self.get_gradient(
                 pred_cls,
                 pool_features,
@@ -1345,12 +1395,20 @@ class RCNN(nn.Module):
                 dam_size,
             )
 
-            loss_rcnn_match = match_loss(
+            loss_rcnn_match, loss_rcnn_match_raw = match_loss(
                 pred_dams,
                 assigned_gts_fg,
                 fg_batch_ids,
                 pred_bbox_odam,
                 pred_gt_ious_odam,
+                reliability=reliability_odam,
+                return_raw=True,
+            )
+            self.last_odam_filter_stats["odam_loss_raw"] = float(
+                loss_rcnn_match_raw.detach().cpu()
+            )
+            self.last_odam_filter_stats["odam_loss_weighted"] = float(
+                loss_rcnn_match.detach().cpu()
             )
 
             # DPGA NOTE:
@@ -1866,12 +1924,124 @@ def odam_quality_filter_mask(
     )
 
 
+def odam_reliability_weights(
+    pred_gt_iou: torch.Tensor,
+    class_scores: torch.Tensor,
+    enabled: bool,
+    iou_tau: float,
+    iou_temperature: float,
+    score_tau: float,
+    score_temperature: float,
+) -> torch.Tensor:
+    """
+    Soft controller weights for ODAM-only supervision.
+
+    The weights are detached by design: reliability should describe proposal
+    quality, not introduce a new path that lets the detector minimize ODAM by
+    lowering its own confidence.
+    """
+    pred_gt_iou = pred_gt_iou.flatten()
+    class_scores = class_scores.flatten()
+
+    if pred_gt_iou.numel() != class_scores.numel():
+        raise ValueError(
+            "pred_gt_iou and class_scores must have the same number of elements"
+        )
+    if float(iou_temperature) <= 0.0:
+        raise ValueError("iou_temperature must be > 0")
+    if float(score_temperature) <= 0.0:
+        raise ValueError("score_temperature must be > 0")
+
+    if not enabled:
+        return torch.ones(
+            pred_gt_iou.shape,
+            dtype=pred_gt_iou.dtype,
+            device=pred_gt_iou.device,
+        )
+
+    iou_weight = torch.sigmoid(
+        (pred_gt_iou - float(iou_tau)) / float(iou_temperature)
+    )
+    score_weight = torch.sigmoid(
+        (class_scores - float(score_tau)) / float(score_temperature)
+    )
+    return (iou_weight * score_weight).detach()
+
+
+def _stat_float(values: torch.Tensor, fn, default: float = 0.0) -> float:
+    if values.numel() == 0:
+        return default
+    return float(fn(values).detach().cpu())
+
+
+def odam_reliability_summary(
+    reliability: torch.Tensor,
+    pred_gt_iou: torch.Tensor,
+    class_scores: torch.Tensor,
+) -> dict:
+    reliability = reliability.flatten().detach()
+    pred_gt_iou = pred_gt_iou.flatten().detach()
+    class_scores = class_scores.flatten().detach()
+
+    if reliability.numel() == 0:
+        return {
+            "reliability_mean": 0.0,
+            "reliability_std": 0.0,
+            "reliability_p10": 0.0,
+            "reliability_p50": 0.0,
+            "reliability_p90": 0.0,
+            "roi_iou_mean": 0.0,
+            "roi_score_mean": 0.0,
+            "effective_odam_rois": 0.0,
+            "low_reliability_fraction": 0.0,
+            "high_reliability_fraction": 0.0,
+            "odam_loss_raw": 0.0,
+            "odam_loss_weighted": 0.0,
+        }
+
+    rel_float = reliability.float()
+    return {
+        "reliability_mean": _stat_float(rel_float, torch.mean),
+        "reliability_std": _stat_float(
+            rel_float,
+            lambda value: torch.std(value, unbiased=False),
+        ),
+        "reliability_p10": _stat_float(
+            rel_float,
+            lambda value: torch.quantile(value, 0.10),
+        ),
+        "reliability_p50": _stat_float(
+            rel_float,
+            lambda value: torch.quantile(value, 0.50),
+        ),
+        "reliability_p90": _stat_float(
+            rel_float,
+            lambda value: torch.quantile(value, 0.90),
+        ),
+        "roi_iou_mean": _stat_float(pred_gt_iou.float(), torch.mean),
+        "roi_score_mean": _stat_float(class_scores.float(), torch.mean),
+        "effective_odam_rois": float(rel_float.sum().detach().cpu()),
+        "low_reliability_fraction": _stat_float(
+            (rel_float < 0.25).float(),
+            torch.mean,
+        ),
+        "high_reliability_fraction": _stat_float(
+            (rel_float >= 0.75).float(),
+            torch.mean,
+        ),
+        "odam_loss_raw": 0.0,
+        "odam_loss_weighted": 0.0,
+    }
+
+
 def match_loss(
     dams: torch.Tensor,
     gt_ids: torch.Tensor,
     batch_ids: torch.Tensor,
     pred_bbox: torch.Tensor,
     pred_gt_iou: torch.Tensor,
+    reliability: Optional[torch.Tensor] = None,
+    return_raw: bool = False,
 ):
     """
     Positive:
@@ -1880,16 +2050,29 @@ def match_loss(
         prediction thuộc GT khác nhưng bbox overlap -> DAM similarity -> 0
     """
     zero_loss = dams.sum() * 0.0 + pred_bbox.sum() * 0.0
+    def maybe_tuple(loss: torch.Tensor, raw_loss: torch.Tensor):
+        return (loss, raw_loss) if return_raw else loss
+
     if dams.numel() == 0:
-        return zero_loss
+        return maybe_tuple(zero_loss, zero_loss)
 
     M, _ = dams.shape
 
     gt_ids = gt_ids.long()
     batch_ids = batch_ids.long()
+    if reliability is None:
+        reliability = pred_gt_iou.new_ones((M,))
+    else:
+        reliability = reliability.flatten().to(
+            device=pred_gt_iou.device,
+            dtype=pred_gt_iou.dtype,
+        )
+        if reliability.numel() != M:
+            raise ValueError("reliability must have one value per DAM/ROI")
+        reliability = reliability.detach()
 
     if gt_ids.numel() == 0:
-        return zero_loss
+        return maybe_tuple(zero_loss, zero_loss)
 
     same_obj, neg_mask, object_ids = image_aware_pair_masks(
         gt_ids,
@@ -1913,7 +2096,7 @@ def match_loss(
     max_iou = max_iou[valid_gt]
 
     if max_position.numel() == 0:
-        return zero_loss
+        return maybe_tuple(zero_loss, zero_loss)
 
     # Rows là reference proposal tốt nhất của từng GT.
     pos_pair1, pos_pair2 = same_obj[
@@ -1942,26 +2125,40 @@ def match_loss(
             / max_iou[pos_pair1].clamp(min=1e-4)
         )
 
-        pos_term = (
+        pos_losses = (
             pos_weights
             * (-torch.log(pos_sims))
-        ).sum()
+        )
+        pos_term = pos_losses.sum()
+        pos_reliability = reliability[pos_pair2]
+        weighted_pos_term = (pos_reliability * pos_losses).sum()
+        pos_weight_denom = pos_reliability.sum()
     else:
         pos_term = zero_loss
+        weighted_pos_term = zero_loss
+        pos_weight_denom = zero_loss
 
     if neg_sims.numel() > 0:
-        neg_term = (
-            -torch.log(1 - neg_sims)
-        ).sum()
+        neg_losses = -torch.log(1 - neg_sims)
+        neg_term = neg_losses.sum()
+        neg_reliability = reliability[neg_pair2]
+        weighted_neg_term = (neg_reliability * neg_losses).sum()
+        neg_weight_denom = neg_reliability.sum()
     else:
         neg_term = zero_loss
+        weighted_neg_term = zero_loss
+        neg_weight_denom = zero_loss
 
     denom = max(
         1,
         int(pos_sims.numel() + neg_sims.numel()),
     )
 
-    return (pos_term + neg_term) / denom
+    raw_loss = (pos_term + neg_term) / denom
+    weight_denom = (pos_weight_denom + neg_weight_denom).clamp(min=1e-12)
+    weighted_loss = (weighted_pos_term + weighted_neg_term) / weight_denom
+
+    return maybe_tuple(weighted_loss, raw_loss)
 
 
 # =============================================================================
@@ -2047,6 +2244,14 @@ def validate_config(config):
         raise ValueError("odam_min_iou must be in [0, 1]")
     if not 0.0 <= float(getattr(config, "odam_min_score", 0.9)) <= 1.0:
         raise ValueError("odam_min_score must be in [0, 1]")
+    if not 0.0 <= float(getattr(config, "odam_reliability_iou_tau", 0.6)) <= 1.0:
+        raise ValueError("odam_reliability_iou_tau must be in [0, 1]")
+    if not 0.0 <= float(getattr(config, "odam_reliability_score_tau", 0.7)) <= 1.0:
+        raise ValueError("odam_reliability_score_tau must be in [0, 1]")
+    if float(getattr(config, "odam_reliability_iou_temp", 0.1)) <= 0.0:
+        raise ValueError("odam_reliability_iou_temp must be > 0")
+    if float(getattr(config, "odam_reliability_score_temp", 0.1)) <= 0.0:
+        raise ValueError("odam_reliability_score_temp must be > 0")
 
     return True
 
@@ -2181,6 +2386,7 @@ class DPGAConfig:
 class DPGAModuleStats:
     name: str
     cosine_before: float
+    cosine_projected: float
     cosine_after: float
 
     det_norm: float
@@ -2683,6 +2889,11 @@ class DPGAController:
             projected = True
 
         odam_norm_proj = _dpga_norm(g_proj)
+        cosine_projected = _dpga_cosine(
+            g_det,
+            g_proj,
+            cfg.eps,
+        )
 
         # ---------------------------------------------------------------------
         # Step B — norm cap
@@ -2763,6 +2974,7 @@ class DPGAController:
         stats = DPGAModuleStats(
             name=name,
             cosine_before=float(cosine_before.detach().cpu()),
+            cosine_projected=float(cosine_projected.detach().cpu()),
             cosine_after=float(cosine_after.detach().cpu()),
             det_norm=float(det_norm.detach().cpu()),
             odam_norm_before=float(odam_norm_before.detach().cpu()),

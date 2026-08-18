@@ -44,6 +44,7 @@ STAGE_ORDER = {
     "E3": 4,
     "E4": 5,
     "E5": 6,
+    "E6": 7,
 }
 
 HIGHER_IS_BETTER = {
@@ -339,6 +340,23 @@ def summarize_training_metrics(run: RunArtifact, rows: Sequence[Dict[str, str]])
         out[f"final_{metric}"] = final_metric(rows, metric)
 
     for metric in ["odam_num_candidates", "odam_num_kept", "odam_keep_ratio"]:
+        out[f"mean_{metric}"] = mean(to_float(row.get(metric)) for row in rows)
+        out[f"final_{metric}"] = final_metric(rows, metric)
+
+    for metric in [
+        "odam_reliability_mean",
+        "odam_reliability_std",
+        "odam_reliability_p10",
+        "odam_reliability_p50",
+        "odam_reliability_p90",
+        "odam_roi_iou_mean",
+        "odam_roi_score_mean",
+        "odam_loss_raw",
+        "odam_loss_weighted",
+        "odam_effective_rois",
+        "odam_low_reliability_fraction",
+        "odam_high_reliability_fraction",
+    ]:
         out[f"mean_{metric}"] = mean(to_float(row.get(metric)) for row in rows)
         out[f"final_{metric}"] = final_metric(rows, metric)
 
@@ -812,6 +830,8 @@ def summarize_gradient_rows(run: RunArtifact) -> Dict:
         "cosine_similarity_median": median(col("cosine_raw")),
         "cosine_similarity_min": minimum(col("cosine_raw")),
         "cosine_similarity_max": maximum(col("cosine_raw")),
+        "cosine_projected_mean": mean(col("cosine_projected")),
+        "cosine_projected_median": median(col("cosine_projected")),
         "gradient_conflict_rate": mean(conflict_step_flags),
         "gradient_conflict_rate_module_rows": mean(conflict_row_flags),
         "det_gradient_norm_mean": mean(col("det_gradient_norm")),
@@ -877,8 +897,56 @@ def read_exported_xai_quality_files(run: RunArtifact) -> List[Dict]:
     return out
 
 
+def read_exported_xai_quality_summary(run: RunArtifact) -> Optional[Dict]:
+    summary_paths = sorted(run.path.parent.glob("xai_quality_*_summary.json"))
+    for path in summary_paths:
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("run_dir", "")).lower() == run.path.name.lower():
+                item = dict(row)
+                item["source_file"] = path.name
+                return item
+    return None
+
+
 def summarize_xai_rows(run: RunArtifact, training_summary: Dict) -> Dict:
     exported_rows = read_exported_xai_quality_files(run)
+    exported_summary = None if exported_rows else read_exported_xai_quality_summary(run)
+    if exported_summary:
+        bbox_energy = to_float(exported_summary.get("bbox_energy_ratio"))
+        pointing_game = to_float(exported_summary.get("pointing_game"))
+        saliency_iou = to_float(exported_summary.get("saliency_iou"))
+        match_iou = to_float(exported_summary.get("detection_match_iou"))
+        samples_value = to_float(exported_summary.get("samples"))
+        samples = int(samples_value) if math.isfinite(samples_value) else 0
+        return {
+            "run": run.label,
+            "run_dir": run.path.name,
+            "xai_source": "export_xai_metrics_summary",
+            "bbox_energy_ratio_mean": bbox_energy,
+            "bbox_energy_ratio_median": bbox_energy,
+            "bbox_energy_ratio_final_epoch": bbox_energy,
+            "bbox_energy_samples": samples,
+            "bbox_energy_final_samples": samples,
+            "pointing_game": pointing_game,
+            "pointing_game_final_epoch": pointing_game,
+            "saliency_iou": saliency_iou,
+            "saliency_iou_final_epoch": saliency_iou,
+            "detection_match_iou_mean": match_iou,
+            "detection_match_iou_final_epoch": match_iou,
+            "xai_metric_note": (
+                "XAI metrics were read from the aggregate "
+                f"{exported_summary.get('source_file')} artifact."
+            ),
+        }
+
     rows = exported_rows if exported_rows else read_odam_quality_files(run)
     final_epoch = int(training_summary.get("epochs", 0)) - 1
     final_rows = [

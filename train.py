@@ -217,6 +217,11 @@ class DetectorConfig:
     odam_filtering: bool = False
     odam_min_iou: float = 0.7
     odam_min_score: float = 0.9
+    odam_reliability: bool = False
+    odam_reliability_iou_tau: float = 0.6
+    odam_reliability_iou_temp: float = 0.1
+    odam_reliability_score_tau: float = 0.7
+    odam_reliability_score_temp: float = 0.1
 
     # Per-process batch size; set from CLI.
     train_batch_per_gpu: int = 1
@@ -1275,6 +1280,7 @@ class ExperimentStageConfig:
     stage: str
     warmup_enabled: bool
     filtering_enabled: bool
+    reliability_enabled: bool
     projection_enabled: bool
     norm_cap_enabled: bool
     gate_enabled: bool
@@ -1293,6 +1299,7 @@ EXPERIMENT_STAGE_PRESETS = {
         "E0",
         warmup_enabled=False,
         filtering_enabled=False,
+        reliability_enabled=False,
         projection_enabled=False,
         norm_cap_enabled=False,
         gate_enabled=False,
@@ -1301,6 +1308,7 @@ EXPERIMENT_STAGE_PRESETS = {
         "E1",
         warmup_enabled=True,
         filtering_enabled=False,
+        reliability_enabled=False,
         projection_enabled=False,
         norm_cap_enabled=False,
         gate_enabled=False,
@@ -1309,6 +1317,7 @@ EXPERIMENT_STAGE_PRESETS = {
         "E2",
         warmup_enabled=True,
         filtering_enabled=True,
+        reliability_enabled=False,
         projection_enabled=False,
         norm_cap_enabled=False,
         gate_enabled=False,
@@ -1317,6 +1326,7 @@ EXPERIMENT_STAGE_PRESETS = {
         "E3",
         warmup_enabled=True,
         filtering_enabled=True,
+        reliability_enabled=False,
         projection_enabled=True,
         norm_cap_enabled=False,
         gate_enabled=False,
@@ -1325,6 +1335,7 @@ EXPERIMENT_STAGE_PRESETS = {
         "E4",
         warmup_enabled=True,
         filtering_enabled=True,
+        reliability_enabled=False,
         projection_enabled=True,
         norm_cap_enabled=True,
         gate_enabled=False,
@@ -1333,6 +1344,16 @@ EXPERIMENT_STAGE_PRESETS = {
         "E5",
         warmup_enabled=True,
         filtering_enabled=True,
+        reliability_enabled=False,
+        projection_enabled=True,
+        norm_cap_enabled=True,
+        gate_enabled=True,
+    ),
+    "E6": ExperimentStageConfig(
+        "E6",
+        warmup_enabled=True,
+        filtering_enabled=False,
+        reliability_enabled=True,
         projection_enabled=True,
         norm_cap_enabled=True,
         gate_enabled=True,
@@ -1341,8 +1362,8 @@ EXPERIMENT_STAGE_PRESETS = {
 
 
 AUX_SAFETY_EPS = 1e-8
-METRICS_SCHEMA_VERSION = 3
-GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 3
+METRICS_SCHEMA_VERSION = 4
+GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 4
 
 
 def resolve_experiment_stage_config(stage: str) -> ExperimentStageConfig:
@@ -1350,7 +1371,7 @@ def resolve_experiment_stage_config(stage: str) -> ExperimentStageConfig:
         return EXPERIMENT_STAGE_PRESETS[str(stage)]
     except KeyError as exc:
         raise ValueError(
-            "--experiment-stage must be one of {E0,E1,E2,E3,E4,E5}"
+            "--experiment-stage must be one of {E0,E1,E2,E3,E4,E5,E6}"
         ) from exc
 
 
@@ -1384,6 +1405,7 @@ def apply_experiment_stage_preset(
     argv = list(sys.argv[1:] if argv is None else argv)
     args.warmup_enabled = False
     args.filtering_enabled = bool(args.odam_filtering)
+    args.reliability_enabled = bool(args.odam_reliability)
     args.projection_enabled = bool(args.dpga_projection)
     args.norm_cap_enabled = bool(args.dpga_norm_cap)
     args.gate_enabled = bool(args.dpga_gate)
@@ -1404,6 +1426,7 @@ def apply_experiment_stage_preset(
             and (args.dpga_warmup > 0 or args.dpga_rampup > 0)
         )
         args.filtering_enabled = bool(args.odam_filtering)
+        args.reliability_enabled = bool(args.odam_reliability)
         return args
 
     for option in (
@@ -1437,10 +1460,19 @@ def apply_experiment_stage_preset(
         raise ValueError(
             "--odam-filtering conflicts with this --experiment-stage."
         )
+    if (
+        _cli_option_supplied(argv, "--odam-reliability")
+        and not stage.reliability_enabled
+    ):
+        raise ValueError(
+            "--odam-reliability conflicts with this --experiment-stage."
+        )
 
     args.warmup_enabled = stage.warmup_enabled
     args.odam_filtering = stage.filtering_enabled
     args.filtering_enabled = stage.filtering_enabled
+    args.odam_reliability = stage.reliability_enabled
+    args.reliability_enabled = stage.reliability_enabled
     args.dpga_projection = stage.projection_enabled
     args.dpga_norm_cap = stage.norm_cap_enabled
     args.dpga_gate = stage.gate_enabled
@@ -1908,6 +1940,7 @@ def format_train_step_log(
         f"experiment_stage={args.experiment_stage} "
         f"warmup={int(bool(args.warmup_enabled))} "
         f"filtering={int(bool(args.filtering_enabled))} "
+        f"reliability={int(bool(getattr(args, 'reliability_enabled', False)))} "
         f"projection={int(bool(args.projection_enabled))} "
         f"norm_cap={int(bool(args.norm_cap_enabled))} "
         f"gate={int(bool(args.gate_enabled))} "
@@ -1951,6 +1984,18 @@ def train_one_epoch(
         "odam_num_candidates": 0.0,
         "odam_num_kept": 0.0,
         "odam_keep_ratio": 0.0,
+        "odam_reliability_mean": 0.0,
+        "odam_reliability_std": 0.0,
+        "odam_reliability_p10": 0.0,
+        "odam_reliability_p50": 0.0,
+        "odam_reliability_p90": 0.0,
+        "odam_roi_iou_mean": 0.0,
+        "odam_roi_score_mean": 0.0,
+        "odam_loss_raw": 0.0,
+        "odam_loss_weighted": 0.0,
+        "odam_effective_rois": 0.0,
+        "odam_low_reliability_fraction": 0.0,
+        "odam_high_reliability_fraction": 0.0,
     }
 
     num_steps = 0
@@ -2155,6 +2200,66 @@ def train_one_epoch(
             odam_num_kept
             / odam_num_candidates.clamp(min=1.0)
         )
+        odam_reliability_mean = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_mean", 0.0))
+            )
+        )
+        odam_reliability_std = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_std", 0.0))
+            )
+        )
+        odam_reliability_p10 = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_p10", 0.0))
+            )
+        )
+        odam_reliability_p50 = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_p50", 0.0))
+            )
+        )
+        odam_reliability_p90 = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_p90", 0.0))
+            )
+        )
+        odam_roi_iou_mean = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("roi_iou_mean", 0.0))
+            )
+        )
+        odam_roi_score_mean = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("roi_score_mean", 0.0))
+            )
+        )
+        odam_loss_raw = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("odam_loss_raw", 0.0))
+            )
+        )
+        odam_loss_weighted = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("odam_loss_weighted", 0.0))
+            )
+        )
+        odam_effective_rois = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("effective_odam_rois", 0.0))
+            )
+        )
+        odam_low_reliability_fraction = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("low_reliability_fraction", 0.0))
+            )
+        )
+        odam_high_reliability_fraction = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("high_reliability_fraction", 0.0))
+            )
+        )
 
         totals["loss_det"] += float(
             loss_det_reduced.cpu()
@@ -2180,6 +2285,42 @@ def train_one_epoch(
         )
         totals["odam_keep_ratio"] += float(
             odam_keep_ratio.cpu()
+        )
+        totals["odam_reliability_mean"] += float(
+            odam_reliability_mean.cpu()
+        )
+        totals["odam_reliability_std"] += float(
+            odam_reliability_std.cpu()
+        )
+        totals["odam_reliability_p10"] += float(
+            odam_reliability_p10.cpu()
+        )
+        totals["odam_reliability_p50"] += float(
+            odam_reliability_p50.cpu()
+        )
+        totals["odam_reliability_p90"] += float(
+            odam_reliability_p90.cpu()
+        )
+        totals["odam_roi_iou_mean"] += float(
+            odam_roi_iou_mean.cpu()
+        )
+        totals["odam_roi_score_mean"] += float(
+            odam_roi_score_mean.cpu()
+        )
+        totals["odam_loss_raw"] += float(
+            odam_loss_raw.cpu()
+        )
+        totals["odam_loss_weighted"] += float(
+            odam_loss_weighted.cpu()
+        )
+        totals["odam_effective_rois"] += float(
+            odam_effective_rois.cpu()
+        )
+        totals["odam_low_reliability_fraction"] += float(
+            odam_low_reliability_fraction.cpu()
+        )
+        totals["odam_high_reliability_fraction"] += float(
+            odam_high_reliability_fraction.cpu()
         )
         num_steps += 1
 
@@ -2251,6 +2392,18 @@ CSV_FIELDS = [
     "odam_num_candidates",
     "odam_num_kept",
     "odam_keep_ratio",
+    "odam_reliability_mean",
+    "odam_reliability_std",
+    "odam_reliability_p10",
+    "odam_reliability_p50",
+    "odam_reliability_p90",
+    "odam_roi_iou_mean",
+    "odam_roi_score_mean",
+    "odam_loss_raw",
+    "odam_loss_weighted",
+    "odam_effective_rois",
+    "odam_low_reliability_fraction",
+    "odam_high_reliability_fraction",
     "AP",
     "AP50",
     "AP75",
@@ -2278,6 +2431,7 @@ GRADIENT_DIAGNOSTIC_FIELDS = [
     "gradient_scope",
     "world_size",
     "cosine_raw",
+    "cosine_projected",
     "det_norm",
     "det_gradient_norm",
     "odam_norm_raw",
@@ -2536,6 +2690,7 @@ def compute_odam_gradient_diagnostics(
                 "gradient_scope": gradient_scope,
                 "world_size": world_size,
                 "cosine_raw": cosine_raw,
+                "cosine_projected": cosine_raw,
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
                 "odam_norm_raw": odam_norm,
@@ -2652,6 +2807,13 @@ def dpga_stats_to_diagnostic_rows(
                 "gradient_scope": getattr(stats, "gradient_scope", "local"),
                 "world_size": getattr(stats, "world_size", current_world_size()),
                 "cosine_raw": float(module_stats.cosine_before),
+                "cosine_projected": float(
+                    getattr(
+                        module_stats,
+                        "cosine_projected",
+                        module_stats.cosine_after,
+                    )
+                ),
                 "det_norm": det_norm,
                 "det_gradient_norm": det_norm,
                 "odam_norm_raw": odam_norm_raw,
@@ -2737,7 +2899,7 @@ def parse_args():
         default=None,
         help=(
             "Incremental ODAM/DPGA ablation stage. E0-E2 require "
-            "--method odam; E3-E5 require --method dpga."
+            "--method odam; E3-E6 require --method dpga."
         ),
     )
 
@@ -2827,6 +2989,34 @@ def parse_args():
     )
     parser.add_argument("--odam-min-iou", type=float, default=0.7)
     parser.add_argument("--odam-min-score", type=float, default=0.9)
+    parser.add_argument(
+        "--odam-reliability",
+        action="store_true",
+        help=(
+            "Enable soft reliability-aware ODAM weighting for legacy/manual "
+            "runs. Stage E6 sets this automatically."
+        ),
+    )
+    parser.add_argument(
+        "--odam-reliability-iou-tau",
+        type=float,
+        default=0.6,
+    )
+    parser.add_argument(
+        "--odam-reliability-iou-temp",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--odam-reliability-score-tau",
+        type=float,
+        default=0.7,
+    )
+    parser.add_argument(
+        "--odam-reliability-score-temp",
+        type=float,
+        default=0.1,
+    )
 
     # DPGA schedule
     parser.add_argument("--dpga-warmup", type=int, default=4)
@@ -2981,12 +3171,22 @@ def parse_args():
         raise ValueError("--odam-min-iou must be in [0, 1]")
     if not 0.0 <= args.odam_min_score <= 1.0:
         raise ValueError("--odam-min-score must be in [0, 1]")
+    if not 0.0 <= args.odam_reliability_iou_tau <= 1.0:
+        raise ValueError("--odam-reliability-iou-tau must be in [0, 1]")
+    if not 0.0 <= args.odam_reliability_score_tau <= 1.0:
+        raise ValueError("--odam-reliability-score-tau must be in [0, 1]")
+    if args.odam_reliability_iou_temp <= 0:
+        raise ValueError("--odam-reliability-iou-temp must be > 0")
+    if args.odam_reliability_score_temp <= 0:
+        raise ValueError("--odam-reliability-score-temp must be > 0")
     if args.backbone_freeze_at not in (0, 1, 2):
         raise ValueError("--backbone-freeze-at must be one of {0, 1, 2}")
     if not 0.0 <= args.rpn_ignore_overlap <= 1.0:
         raise ValueError("--rpn-ignore-overlap must be in [0, 1]")
     if args.method == "baseline" and args.odam_filtering:
         raise ValueError("--odam-filtering is only valid for ODAM/DPGA runs.")
+    if args.method == "baseline" and args.odam_reliability:
+        raise ValueError("--odam-reliability is only valid for ODAM/DPGA runs.")
     return apply_experiment_stage_preset(args, argv=argv)
 
 
@@ -3104,6 +3304,11 @@ def main():
         odam_filtering=args.odam_filtering,
         odam_min_iou=args.odam_min_iou,
         odam_min_score=args.odam_min_score,
+        odam_reliability=args.odam_reliability,
+        odam_reliability_iou_tau=args.odam_reliability_iou_tau,
+        odam_reliability_iou_temp=args.odam_reliability_iou_temp,
+        odam_reliability_score_tau=args.odam_reliability_score_tau,
+        odam_reliability_score_temp=args.odam_reliability_score_temp,
     )
     validate_config(config)
 
@@ -3159,8 +3364,14 @@ def main():
             "experiment_stage": args.experiment_stage,
             "warmup_enabled": bool(args.warmup_enabled),
             "filtering_enabled": bool(args.filtering_enabled),
+            "reliability_enabled": bool(args.reliability_enabled),
             "odam_min_iou": args.odam_min_iou,
             "odam_min_score": args.odam_min_score,
+            "odam_reliability": bool(args.odam_reliability),
+            "odam_reliability_iou_tau": args.odam_reliability_iou_tau,
+            "odam_reliability_iou_temp": args.odam_reliability_iou_temp,
+            "odam_reliability_score_tau": args.odam_reliability_score_tau,
+            "odam_reliability_score_temp": args.odam_reliability_score_temp,
             "projection_enabled": bool(args.projection_enabled),
             "norm_cap_enabled": bool(args.norm_cap_enabled),
             "gate_enabled": bool(args.gate_enabled),
@@ -3246,8 +3457,13 @@ def main():
             "[setup-stage] "
             f"warmup={int(bool(args.warmup_enabled))} "
             f"filtering={int(bool(args.filtering_enabled))} "
+            f"reliability={int(bool(args.reliability_enabled))} "
             f"min_iou={args.odam_min_iou} "
             f"min_score={args.odam_min_score} "
+            f"reliability_iou_tau={args.odam_reliability_iou_tau} "
+            f"reliability_iou_temp={args.odam_reliability_iou_temp} "
+            f"reliability_score_tau={args.odam_reliability_score_tau} "
+            f"reliability_score_temp={args.odam_reliability_score_temp} "
             f"projection={int(bool(args.projection_enabled))} "
             f"norm_cap={int(bool(args.norm_cap_enabled))} "
             f"gate={int(bool(args.gate_enabled))}"

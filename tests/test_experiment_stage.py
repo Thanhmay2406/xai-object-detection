@@ -22,12 +22,13 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover
 class ExperimentStageTest(unittest.TestCase):
     def test_stage_mapping_is_deterministic(self):
         expected = {
-            "E0": (False, False, False, False, False),
-            "E1": (True, False, False, False, False),
-            "E2": (True, True, False, False, False),
-            "E3": (True, True, True, False, False),
-            "E4": (True, True, True, True, False),
-            "E5": (True, True, True, True, True),
+            "E0": (False, False, False, False, False, False),
+            "E1": (True, False, False, False, False, False),
+            "E2": (True, True, False, False, False, False),
+            "E3": (True, True, False, True, False, False),
+            "E4": (True, True, False, True, True, False),
+            "E5": (True, True, False, True, True, True),
+            "E6": (True, False, True, True, True, True),
         }
 
         for stage, values in expected.items():
@@ -37,6 +38,7 @@ class ExperimentStageTest(unittest.TestCase):
                     (
                         cfg.warmup_enabled,
                         cfg.filtering_enabled,
+                        cfg.reliability_enabled,
                         cfg.projection_enabled,
                         cfg.norm_cap_enabled,
                         cfg.gate_enabled,
@@ -69,6 +71,7 @@ class ExperimentStageTest(unittest.TestCase):
 
         self.assertTrue(args.warmup_enabled)
         self.assertTrue(args.filtering_enabled)
+        self.assertFalse(args.reliability_enabled)
         self.assertTrue(args.projection_enabled)
         self.assertTrue(args.norm_cap_enabled)
         self.assertFalse(args.gate_enabled)
@@ -77,6 +80,28 @@ class ExperimentStageTest(unittest.TestCase):
         self.assertFalse(args.dpga_gate)
         self.assertIsNone(args.dpga_ablation)
         self.assertEqual(args.dpga_ablation_label, "E4_incremental")
+
+    def test_e6_cli_sets_soft_reliability_with_e5_dpga_components(self):
+        args = self._parse(
+            "--method",
+            "dpga",
+            "--experiment-stage",
+            "E6",
+        )
+
+        self.assertTrue(args.warmup_enabled)
+        self.assertFalse(args.filtering_enabled)
+        self.assertFalse(args.odam_filtering)
+        self.assertTrue(args.reliability_enabled)
+        self.assertTrue(args.odam_reliability)
+        self.assertTrue(args.projection_enabled)
+        self.assertTrue(args.norm_cap_enabled)
+        self.assertTrue(args.gate_enabled)
+        self.assertEqual(args.dpga_ablation_label, "E6_incremental")
+        self.assertAlmostEqual(args.odam_reliability_iou_tau, 0.6)
+        self.assertAlmostEqual(args.odam_reliability_iou_temp, 0.1)
+        self.assertAlmostEqual(args.odam_reliability_score_tau, 0.7)
+        self.assertAlmostEqual(args.odam_reliability_score_temp, 0.1)
 
     def test_stage_rejects_legacy_dpga_ablation_flags(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
@@ -120,7 +145,7 @@ class ExperimentStageTest(unittest.TestCase):
         self.assertEqual(args.dpga_ablation_label, "A2_projection")
 
     def test_stage_dpga_config_uses_shared_odam_weight_for_fairness(self):
-        for stage in ("E3", "E4", "E5"):
+        for stage in ("E3", "E4", "E5", "E6"):
             with self.subTest(stage=stage):
                 args = self._parse(
                     "--method",
@@ -172,7 +197,7 @@ class ExperimentStageTest(unittest.TestCase):
         )
 
     def test_e3_e4_e5_dpga_smoke_composition_is_finite(self):
-        for stage in ("E3", "E4", "E5"):
+        for stage in ("E3", "E4", "E5", "E6"):
             with self.subTest(stage=stage):
                 args = self._parse(
                     "--method",

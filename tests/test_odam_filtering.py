@@ -51,6 +51,59 @@ class ODAMFilteringTest(unittest.TestCase):
 
         self.assertEqual(keep.tolist(), [True, True, True])
 
+    def test_soft_reliability_is_detached_and_continuous(self):
+        class_scores = torch.tensor([0.30, 0.70, 0.97], requires_grad=True)
+        reliability = network.odam_reliability_weights(
+            pred_gt_iou=torch.tensor([0.25, 0.60, 0.90]),
+            class_scores=class_scores,
+            enabled=True,
+            iou_tau=0.60,
+            iou_temperature=0.10,
+            score_tau=0.70,
+            score_temperature=0.10,
+        )
+
+        self.assertFalse(reliability.requires_grad)
+        self.assertTrue(torch.all(reliability >= 0.0))
+        self.assertTrue(torch.all(reliability <= 1.0))
+        self.assertLess(float(reliability[0]), float(reliability[1]))
+        self.assertLess(float(reliability[1]), float(reliability[2]))
+
+    def test_reliability_weighted_match_loss_downweights_noisy_roi(self):
+        dams = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.5, 0.5],
+            ],
+            requires_grad=True,
+        )
+        gt_ids = torch.tensor([0, 0])
+        batch_ids = torch.tensor([0, 0])
+        boxes = torch.tensor(
+            [
+                [10.0, 10.0, 100.0, 100.0],
+                [12.0, 12.0, 102.0, 102.0],
+            ]
+        )
+        pred_gt_iou = torch.tensor([0.9, 0.45])
+        reliability = torch.tensor([1.0, 0.1])
+
+        weighted, raw = network.match_loss(
+            dams,
+            gt_ids,
+            batch_ids,
+            boxes,
+            pred_gt_iou,
+            reliability=reliability,
+            return_raw=True,
+        )
+        weighted.backward()
+
+        self.assertTrue(torch.isfinite(weighted))
+        self.assertTrue(torch.isfinite(raw))
+        self.assertLess(float(weighted.detach()), float(raw.detach()))
+        self.assertTrue(torch.isfinite(dams.grad).all())
+
     def test_zero_valid_proposals_can_produce_finite_zero_odam_loss(self):
         keep = network.odam_quality_filter_mask(
             pred_gt_iou=torch.tensor([0.1, 0.2]),

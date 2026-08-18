@@ -297,6 +297,62 @@ class MetricsScriptTest(unittest.TestCase):
             self.assertLess(detection["offline_best_MR-2_Small"], 1e-6)
             self.assertTrue(math.isnan(detection["offline_best_MR-2_Heavy"]))
 
+    def test_root_xai_summary_populates_xai_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "outputs"
+            run = root / "e3"
+            run.mkdir(parents=True)
+
+            (run / "experiment.json").write_text(
+                json.dumps({"method": "dpga", "experiment_stage": "E3"}),
+                encoding="utf-8",
+            )
+            write_csv(
+                run / "metrics.csv",
+                [
+                    {
+                        "epoch": 0,
+                        "method": "dpga",
+                        "seconds": 1.0,
+                        "AP": 0.1,
+                        "AP50": 0.2,
+                        "MR-2_generic": 0.8,
+                    }
+                ],
+            )
+            (root / "xai_quality_best_summary.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "run_dir": "e3",
+                            "samples": 12,
+                            "bbox_energy_ratio": 0.75,
+                            "pointing_game": 0.5,
+                            "saliency_iou": 0.25,
+                            "detection_match_iou": 0.6,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            tables = metrics.build_tables(
+                argparse.Namespace(
+                    outputs=root,
+                    output_dir=Path(tmp) / "report",
+                    runs=None,
+                    citypersons_mr_csv=None,
+                )
+            )
+
+            xai = tables["xai"][0]
+            self.assertEqual(xai["xai_source"], "export_xai_metrics_summary")
+            self.assertEqual(xai["bbox_energy_samples"], 12)
+            self.assertAlmostEqual(xai["bbox_energy_ratio_mean"], 0.75)
+            self.assertAlmostEqual(xai["pointing_game"], 0.5)
+            self.assertAlmostEqual(xai["saliency_iou"], 0.25)
+            self.assertAlmostEqual(xai["detection_match_iou_mean"], 0.6)
+
 
 if __name__ == "__main__":
     unittest.main()
