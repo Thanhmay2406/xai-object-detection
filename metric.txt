@@ -1,0 +1,405 @@
+METRIC THỰC NGHIỆM CHO DPGA-ODAM TRÊN CITYPERSONS
+==================================================
+
+Mục tiêu thực nghiệm:
+- So sánh Faster R-CNN baseline, ODAM và DPGA-ODAM.
+- Đánh giá đồng thời:
+  1. Hiệu năng phát hiện.
+  2. Mức độ xung đột gradient.
+  3. Chất lượng giải thích ODAM.
+  4. Chi phí tính toán.
+
+Quy ước:
+- ↑ : càng cao càng tốt.
+- ↓ : càng thấp càng tốt.
+
+
+1. DETECTION METRICS
+====================
+
+Đây là nhóm metric chính để đánh giá hiệu năng detector.
+
+1.1. MR^-2 Reasonable ↓
+-----------------------
+Tên đầy đủ:
+Log-average Miss Rate trên tập Reasonable của CityPersons.
+
+Ý nghĩa:
+- Là metric chính thường dùng cho CityPersons.
+- Đánh giá khả năng bỏ sót pedestrian trong điều kiện tương đối tiêu chuẩn.
+
+Mục tiêu:
+MR^-2 càng thấp càng tốt.
+
+Ưu tiên:
+RẤT CAO - PRIMARY METRIC.
+
+
+1.2. MR^-2 Heavy ↓
+------------------
+Ý nghĩa:
+- Đánh giá pedestrian bị che khuất mạnh.
+- Quan trọng với DPGA-ODAM vì các trường hợp occlusion thường tạo proposal khó và gradient nhiễu.
+
+Mục tiêu:
+MR^-2 Heavy càng thấp càng tốt.
+
+Ưu tiên:
+RẤT CAO.
+
+
+1.3. MR^-2 Small ↓
+------------------
+Ý nghĩa:
+- Đánh giá khả năng phát hiện pedestrian kích thước nhỏ.
+- Hữu ích để kiểm tra DPGA-ODAM trên các object khó.
+
+Mục tiêu:
+MR^-2 Small càng thấp càng tốt.
+
+Ưu tiên:
+CAO.
+
+
+1.4. AP50 ↑
+-----------
+Ý nghĩa:
+- Average Precision tại IoU = 0.5.
+- Cho biết khả năng detection ở ngưỡng IoU tương đối dễ.
+
+Mục tiêu:
+AP50 càng cao càng tốt.
+
+
+1.5. mAP50:95 ↑
+---------------
+Ý nghĩa:
+- Mean Average Precision trên các ngưỡng IoU từ 0.50 đến 0.95.
+- Phản ánh chất lượng detection tổng quát và chất lượng localization.
+
+Mục tiêu:
+mAP50:95 càng cao càng tốt.
+
+
+2. GRADIENT METRICS
+===================
+
+Đây là nhóm metric quan trọng để chứng minh cơ chế của DPGA.
+
+Ký hiệu:
+- g_det  : gradient của detection loss.
+- g_odam : gradient của ODAM loss.
+
+
+2.1. Cosine Similarity
+----------------------
+Công thức:
+
+cos(g_det, g_odam)
+= (g_det · g_odam) / (||g_det|| ||g_odam||)
+
+Ý nghĩa:
+- cos > 0:
+  Detection và ODAM đang hỗ trợ nhau.
+
+- cos ≈ 0:
+  Hai gradient gần như độc lập.
+
+- cos < 0:
+  Hai gradient xung đột.
+
+Cần lưu:
+- Mean cosine similarity.
+- Median cosine similarity.
+- Phân phối cosine similarity theo training step/epoch.
+
+
+2.2. Gradient Conflict Rate ↓
+-----------------------------
+Định nghĩa:
+
+Conflict xảy ra khi:
+
+g_det · g_odam < 0
+
+Conflict Rate:
+
+số step xảy ra conflict
+------------------------
+tổng số step có ODAM
+
+Ý nghĩa:
+- Đo trực tiếp tần suất xung đột giữa detection objective và ODAM objective.
+
+Mục tiêu:
+DPGA-ODAM nên có Conflict Rate thấp hơn ODAM thông thường.
+
+Ưu tiên:
+RẤT CAO.
+
+
+2.3. Gradient Norm
+------------------
+Theo dõi:
+
+||g_det||
+
+||g_odam||
+
+||g_final||
+
+Trong đó:
+g_final là gradient cuối cùng sau khi DPGA xử lý.
+
+Ý nghĩa:
+- Kiểm tra gradient ODAM có quá lớn hoặc quá nhỏ so với detection hay không.
+- Kiểm tra DPGA có giúp ổn định gradient hay không.
+
+
+2.4. Gradient Norm Ratio
+------------------------
+Công thức:
+
+R_norm = ||g_odam|| / ||g_det||
+
+Ý nghĩa:
+- Cho biết mức độ chi phối của ODAM gradient so với detection gradient.
+
+Nếu:
+R_norm >> 1
+
+thì ODAM có thể đang chi phối quá mạnh quá trình optimization.
+
+
+2.5. Projection Rate ↓
+----------------------
+Định nghĩa:
+
+Projection Rate
+= số step DPGA kích hoạt projection / số step có ODAM
+
+Ý nghĩa:
+- Cho biết DPGA phải can thiệp bao nhiêu lần.
+- Có thể phân tích theo epoch để xem gradient conflict giảm dần trong quá trình training hay không.
+
+
+2.6. Final Gradient Norm
+------------------------
+Theo dõi:
+
+||g_DPGA||
+
+Ý nghĩa:
+- Kiểm tra gradient cuối sau projection, norm-cap, gate và composition.
+- Dùng để đánh giá độ ổn định của DPGA.
+
+
+3. XAI / ODAM QUALITY METRICS
+=============================
+
+Nhóm này đánh giá chất lượng heatmap/explanation của ODAM.
+
+
+3.1. Bounding Box Energy Ratio ↑
+--------------------------------
+Ý nghĩa:
+- Đo tỷ lệ năng lượng saliency nằm bên trong ground-truth bounding box.
+
+Dạng tổng quát:
+
+BBox Energy Ratio
+= saliency energy inside GT bbox
+  ------------------------------
+  total saliency energy
+
+Mục tiêu:
+Càng cao càng tốt.
+
+Ưu tiên:
+CAO.
+
+
+3.2. Pointing Game ↑
+--------------------
+Ý nghĩa:
+- Kiểm tra điểm saliency mạnh nhất có nằm bên trong bounding box của object hay không.
+
+Mục tiêu:
+Tỷ lệ Pointing Game càng cao càng tốt.
+
+
+3.3. Saliency IoU ↑
+-------------------
+Ý nghĩa:
+- Đo mức độ overlap giữa vùng saliency và ground-truth object.
+
+Mục tiêu:
+Càng cao càng tốt.
+
+Ghi chú:
+Metric này có thể dùng như metric bổ sung nếu không muốn bảng kết quả quá lớn.
+
+
+4. COMPUTATIONAL COST METRICS
+=============================
+
+Nhóm này dùng để đánh giá overhead của DPGA-ODAM.
+
+
+4.1. Training Time / Epoch ↓
+----------------------------
+So sánh:
+
+- Faster R-CNN baseline
+- Faster R-CNN + ODAM
+- Faster R-CNN + DPGA-ODAM
+
+Ý nghĩa:
+Đánh giá chi phí thời gian huấn luyện do ODAM và DPGA tạo ra.
+
+
+4.2. Peak GPU Memory ↓
+----------------------
+Đơn vị:
+MB hoặc GB.
+
+Ý nghĩa:
+- Đánh giá lượng VRAM tối đa cần sử dụng.
+- Quan trọng khi ODAM cần giữ graph để tính gradient bổ sung.
+
+
+4.3. Inference Time / FPS
+-------------------------
+Có thể báo cáo:
+
+- ms/image ↓
+hoặc
+- FPS ↑
+
+Kỳ vọng:
+Nếu DPGA chỉ được sử dụng trong training thì inference cost gần như không thay đổi.
+
+
+4.4. Number of Parameters
+-------------------------
+Ý nghĩa:
+- Kiểm tra DPGA có làm tăng số lượng tham số của detector hay không.
+
+Kỳ vọng:
+Nếu DPGA chỉ là gradient controller thì số parameter của detector không đổi.
+
+
+5. BỘ METRIC CHÍNH ĐỀ XUẤT
+==========================
+
+Nếu cần một bộ metric đủ mạnh nhưng không quá dàn trải, sử dụng:
+
+A. Detection:
+- MR^-2 Reasonable ↓
+- MR^-2 Heavy ↓
+- MR^-2 Small ↓
+- AP50 ↑
+- mAP50:95 ↑
+
+B. Gradient:
+- Cosine Similarity
+- Gradient Conflict Rate ↓
+- Gradient Norm
+- Gradient Norm Ratio
+- Projection Rate ↓
+
+C. XAI:
+- Bounding Box Energy Ratio ↑
+- Pointing Game ↑
+
+D. Computational Cost:
+- Training Time / Epoch ↓
+- Peak GPU Memory ↓
+
+
+6. BẢNG KẾT QUẢ CHÍNH ĐỀ XUẤT
+=============================
+
+Method                 MR-R ↓   MR-H ↓   MR-S ↓   AP50 ↑   mAP50:95 ↑
+----------------------------------------------------------------------
+Faster R-CNN
+Faster R-CNN + ODAM
+Faster R-CNN + DPGA-ODAM
+
+
+7. BẢNG PHÂN TÍCH GRADIENT ĐỀ XUẤT
+===================================
+
+Method                 CosSim ↑   Conflict Rate ↓   Norm Ratio   Projection Rate ↓
+----------------------------------------------------------------------------------
+ODAM
+DPGA-ODAM
+
+
+8. BẢNG XAI ĐỀ XUẤT
+===================
+
+Method                 BBox Energy ↑   Pointing Game ↑   Saliency IoU ↑
+------------------------------------------------------------------------
+ODAM
+DPGA-ODAM
+
+
+9. BẢNG CHI PHÍ TÍNH TOÁN ĐỀ XUẤT
+==================================
+
+Method                 Time/Epoch ↓   Peak VRAM ↓   FPS ↑
+----------------------------------------------------------
+Faster R-CNN
+ODAM
+DPGA-ODAM
+
+
+10. KẾT LUẬN VỀ THỨ TỰ ƯU TIÊN
+===============================
+
+Metric quan trọng nhất:
+
+1. MR^-2 Reasonable
+2. MR^-2 Heavy
+3. Gradient Conflict Rate
+4. Cosine Similarity
+5. MR^-2 Small
+6. mAP50:95
+7. AP50
+8. Bounding Box Energy Ratio
+9. Pointing Game
+10. Training Time / Peak GPU Memory
+
+Logic chứng minh của nghiên cứu:
+
+ODAM
+  ->
+gradient conflict / gradient imbalance
+  ->
+DPGA xử lý gradient
+  ->
+Conflict Rate giảm
+Cosine Similarity được cải thiện
+gradient ổn định hơn
+  ->
+MR^-2 giảm
+AP/mAP tăng hoặc được duy trì
+  ->
+chất lượng ODAM được duy trì hoặc cải thiện.
+
+
+TÓM TẮT
+=======
+
+Detection chứng minh:
+"DPGA-ODAM có hiệu quả hay không?"
+
+Gradient metrics chứng minh:
+"Tại sao DPGA-ODAM có hiệu quả?"
+
+XAI metrics chứng minh:
+"Việc tối ưu gradient có làm mất chất lượng explanation hay không?"
+
+Computational metrics chứng minh:
+"Cải tiến này phải trả giá bao nhiêu về tài nguyên?"

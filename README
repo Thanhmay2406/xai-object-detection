@@ -66,3 +66,49 @@ proposals used to construct `loss_rcnn_match`, not detection training targets.
 
 See `experiment_commands.md` for E0-E5 command templates, environment capture,
 and the recommended pre-flight smoke checks.
+
+Offline metric reports:
+
+After training has produced run directories such as `outputs/e0` through
+`outputs/e5`, use `metrics.py` to aggregate detection, gradient, XAI, and
+runtime tables from saved artifacts:
+
+```bash
+python metrics.py \
+  --outputs outputs \
+  --output-dir outputs/metrics_report \
+  --val-ann data/coco/valid/_annotations.coco.json \
+  --offline-prediction-epoch both
+```
+
+This reads `metrics.csv`, `experiment.json`, `predictions_epoch_*.json`,
+`gradient_diagnostics_rank*.csv`, `odam_quality_epoch_*.json`, and optional
+`xai_quality_best.json` / `xai_quality_last.json` files. It writes
+`detection_metrics.csv`, `gradient_metrics.csv`, `xai_metrics.csv`,
+`computational_cost_metrics.csv`, `method_metrics_summary.csv`, and
+`metric_report.md`.
+
+`offline_*MR-2_Reasonable`, `offline_*MR-2_Heavy`, and `offline_*MR-2_Small`
+are recomputed from saved predictions using CityPersons-style filters in the
+converted COCO annotations. Use `--citypersons-mr-csv` to merge results from an
+external official CityPersons evaluator when preparing paper tables.
+
+XAI metric export:
+
+`Pointing Game` and `Saliency IoU` require ODAM heatmaps and therefore need a
+checkpoint forward pass. This is validation-only and does not retrain:
+
+```bash
+python export_xai_metrics.py \
+  --outputs outputs \
+  --runs e0 e1 e2 e3 e4 e5 \
+  --checkpoint best \
+  --val-images data/coco/valid \
+  --val-ann data/coco/valid/_annotations.coco.json \
+  --device cuda
+```
+
+The export creates `xai_quality_best.json`,
+`xai_quality_best_summary.json`, and `xai_quality_best_predictions.json` in
+each selected run directory. Run `metrics.py` again after export to populate
+`pointing_game` and `saliency_iou` in `xai_metrics.csv`.
