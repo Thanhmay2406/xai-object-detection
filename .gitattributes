@@ -1,0 +1,8 @@
+results/sab_odam_train/best.pt filter=lfs diff=lfs merge=lfs -text
+results/city-persons/baseline_frcnn_imagenet/best.pt filter=lfs diff=lfs merge=lfs -text
+results/city-persons/dp_odam_citypersons_imagenet/best.pt filter=lfs diff=lfs merge=lfs -text
+results/city-persons/dp_odam_nms_citypersons_imagenet/best.pt filter=lfs diff=lfs merge=lfs -text
+results/city-persons/rcnn_odam_citypersons_imagenet/best.pt filter=lfs diff=lfs merge=lfs -text
+results/city-persons/sab_odam_citypersons_imagenet/best.pt filter=lfs diff=lfs merge=lfs -text
+results/city-persons/dpga_odam_citypersons_imagenet/best.pt filter=lfs diff=lfs merge=lfs -text
+outputs/**/*.pt filter=lfs diff=lfs merge=lfs -text
