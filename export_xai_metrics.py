@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
         "--runs",
         nargs="*",
         default=None,
-        help="Run directory names to export. Defaults to e0 e1 e2 e3 e4 e5 if present.",
+        help="Run directory names to export. Defaults to e0 e1 e2 e3 e4 e5 e6 if present.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -152,7 +152,7 @@ def discover_run_dirs(outputs: Path, selected: Optional[Sequence[str]], include_
     if selected:
         run_dirs = [outputs / name for name in selected]
     else:
-        preferred = ["e0", "e1", "e2", "e3", "e4", "e5"]
+        preferred = ["e0", "e1", "e2", "e3", "e4", "e5", "e6"]
         run_dirs = [outputs / name for name in preferred if (outputs / name).is_dir()]
         if include_baseline and (outputs / "baseline").is_dir():
             run_dirs.insert(0, outputs / "baseline")

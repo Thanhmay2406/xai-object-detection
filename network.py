@@ -2034,6 +2034,15 @@ def odam_reliability_summary(
     }
 
 
+def odam_pair_reliability(
+    reference_reliability: torch.Tensor,
+    target_reliability: torch.Tensor,
+) -> torch.Tensor:
+    return torch.sqrt(
+        (reference_reliability * target_reliability).clamp(min=0.0)
+    )
+
+
 def match_loss(
     dams: torch.Tensor,
     gt_ids: torch.Tensor,
@@ -2108,6 +2117,7 @@ def match_loss(
     ].nonzero(as_tuple=True)
 
     ref_dams = dams[max_position]
+    reference_reliability = reliability[max_position]
 
     pos_sims = (
         ref_dams[pos_pair1]
@@ -2130,7 +2140,10 @@ def match_loss(
             * (-torch.log(pos_sims))
         )
         pos_term = pos_losses.sum()
-        pos_reliability = reliability[pos_pair2]
+        pos_reliability = odam_pair_reliability(
+            reference_reliability[pos_pair1],
+            reliability[pos_pair2],
+        )
         weighted_pos_term = (pos_reliability * pos_losses).sum()
         pos_weight_denom = pos_reliability.sum()
     else:
@@ -2141,7 +2154,10 @@ def match_loss(
     if neg_sims.numel() > 0:
         neg_losses = -torch.log(1 - neg_sims)
         neg_term = neg_losses.sum()
-        neg_reliability = reliability[neg_pair2]
+        neg_reliability = odam_pair_reliability(
+            reference_reliability[neg_pair1],
+            reliability[neg_pair2],
+        )
         weighted_neg_term = (neg_reliability * neg_losses).sum()
         neg_weight_denom = neg_reliability.sum()
     else:

@@ -2898,7 +2898,7 @@ def parse_args():
         choices=tuple(EXPERIMENT_STAGE_PRESETS.keys()),
         default=None,
         help=(
-            "Incremental ODAM/DPGA ablation stage. E0-E2 require "
+            "Progressive ODAM/DPGA ablation stage. E0-E2 require "
             "--method odam; E3-E6 require --method dpga."
         ),
     )

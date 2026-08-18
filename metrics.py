@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional run directory names to include, for example: "
-            "baseline e0 e1 e2 e3 e4 e5."
+            "baseline e0 e1 e2 e3 e4 e5 e6."
         ),
     )
     parser.add_argument(
@@ -246,7 +246,7 @@ def normalize_run_label(run_dir: Path, experiment: Dict) -> str:
     lower = name.lower()
     if lower == "baseline":
         return "baseline"
-    if lower in {"e0", "e1", "e2", "e3", "e4", "e5"}:
+    if lower in {"e0", "e1", "e2", "e3", "e4", "e5", "e6"}:
         return lower.upper()
     return name
 

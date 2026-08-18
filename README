@@ -31,23 +31,24 @@ ODAM/DPGA notes:
   `loss_proxy`, `loss_det`, `loss_odam`, `alpha`, `gate`, and gradient
   diagnostics for DPGA reporting.
 
-Incremental ODAM/DPGA ablation:
+Progressive ODAM/DPGA ablation:
 
-Use `--experiment-stage` to run one cumulative stage at a time. E0-E2 are
-ODAM scalarization stages and should be run with `--method odam`; E3-E5 use
+Use `--experiment-stage` to run one progressive stage at a time. E0-E2 are
+ODAM scalarization stages and should be run with `--method odam`; E3-E6 use
 DPGA gradient composition and should be run with `--method dpga`.
 In stage mode, all stages use the same maximum auxiliary ODAM weight from
 `--odam-weight`; `--dpga-alpha` is kept for legacy DPGA runs without
 `--experiment-stage`.
 
-| Stage | Warm-up | Filtering | Projection | Norm-cap | Gate |
-|------|------|------|------|------|------|
-| E0 | No | No | No | No | No |
-| E1 | Yes | No | No | No | No |
-| E2 | Yes | Yes | No | No | No |
-| E3 | Yes | Yes | Yes | No | No |
-| E4 | Yes | Yes | Yes | Yes | No |
-| E5 | Yes | Yes | Yes | Yes | Yes |
+| Stage | Warm-up | Hard filtering | Soft reliability | Projection | Norm-cap | Gate |
+|------|------|------|------|------|------|------|
+| E0 | No | No | No | No | No | No |
+| E1 | Yes | No | No | No | No | No |
+| E2 | Yes | Yes | No | No | No | No |
+| E3 | Yes | Yes | No | Yes | No | No |
+| E4 | Yes | Yes | No | Yes | Yes | No |
+| E5 | Yes | Yes | No | Yes | Yes | Yes |
+| E6 | Yes | No | Yes | Yes | Yes | Yes |
 
 Example stage commands:
 
@@ -58,19 +59,26 @@ python train.py --method odam --experiment-stage E2 ...
 python train.py --method dpga --experiment-stage E3 ...
 python train.py --method dpga --experiment-stage E4 ...
 python train.py --method dpga --experiment-stage E5 ...
+python train.py --method dpga --experiment-stage E6 ...
 ```
 
-E2-E5 enable ODAM-only proposal quality filtering. The default thresholds are
+E2-E5 enable ODAM-only hard proposal quality filtering. The default thresholds are
 `--odam-min-iou 0.7` and `--odam-min-score 0.9`; filtering affects only
 proposals used to construct `loss_rcnn_match`, not detection training targets.
+E6 keeps the E5 DPGA controller but disables hard filtering and enables
+soft reliability-aware ODAM weighting from proposal-GT IoU and classification
+confidence. The default soft transition parameters are
+`--odam-reliability-iou-tau 0.6`, `--odam-reliability-iou-temp 0.1`,
+`--odam-reliability-score-tau 0.7`, and
+`--odam-reliability-score-temp 0.1`.
 
-See `experiment_commands.md` for E0-E5 command templates, environment capture,
+See `experiment_commands.md` for E0-E6 command templates, environment capture,
 and the recommended pre-flight smoke checks.
 
 Offline metric reports:
 
 After training has produced run directories such as `outputs/e0` through
-`outputs/e5`, use `metrics.py` to aggregate detection, gradient, XAI, and
+`outputs/e6`, use `metrics.py` to aggregate detection, gradient, XAI, and
 runtime tables from saved artifacts:
 
 ```bash
@@ -101,7 +109,7 @@ checkpoint forward pass. This is validation-only and does not retrain:
 ```bash
 python export_xai_metrics.py \
   --outputs outputs \
-  --runs e0 e1 e2 e3 e4 e5 \
+  --runs e0 e1 e2 e3 e4 e5 e6 \
   --checkpoint best \
   --val-images data/coco/valid \
   --val-ann data/coco/valid/_annotations.coco.json \

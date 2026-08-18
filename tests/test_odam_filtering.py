@@ -104,6 +104,24 @@ class ODAMFilteringTest(unittest.TestCase):
         self.assertLess(float(weighted.detach()), float(raw.detach()))
         self.assertTrue(torch.isfinite(dams.grad).all())
 
+    def test_pair_reliability_uses_reference_and_target(self):
+        target = torch.tensor([0.81])
+        high_reference = network.odam_pair_reliability(
+            torch.tensor([1.0]),
+            target,
+        )
+        low_reference = network.odam_pair_reliability(
+            torch.tensor([0.01]),
+            target,
+        )
+
+        self.assertLess(
+            float(low_reference.detach()),
+            float(high_reference.detach()),
+        )
+        self.assertAlmostEqual(float(high_reference), 0.9)
+        self.assertAlmostEqual(float(low_reference), 0.09)
+
     def test_zero_valid_proposals_can_produce_finite_zero_odam_loss(self):
         keep = network.odam_quality_filter_mask(
             pred_gt_iou=torch.tensor([0.1, 0.2]),
