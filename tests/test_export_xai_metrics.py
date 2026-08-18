@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -6,6 +8,23 @@ import export_xai_metrics
 
 
 class ExportXaiMetricsTest(unittest.TestCase):
+    def test_default_discovery_includes_e6(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "outputs"
+            for name in ("baseline", "e0", "e5", "e6"):
+                (root / name).mkdir(parents=True)
+
+            runs = export_xai_metrics.discover_run_dirs(
+                root,
+                selected=None,
+                include_baseline=False,
+            )
+
+            self.assertEqual(
+                [run.name for run in runs],
+                ["e0", "e5", "e6"],
+            )
+
     def test_dam_metrics_compute_pointing_game_and_saliency_iou(self):
         dam = torch.tensor(
             [

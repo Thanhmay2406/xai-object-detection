@@ -18,6 +18,9 @@ def write_csv(path: Path, rows):
 
 
 class MetricsScriptTest(unittest.TestCase):
+    def test_normalize_run_label_accepts_e6_without_metadata(self):
+        self.assertEqual(metrics.normalize_run_label(Path("e6"), {}), "E6")
+
     def test_build_tables_from_minimal_run_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "outputs"
