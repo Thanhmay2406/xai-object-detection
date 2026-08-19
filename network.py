@@ -1113,6 +1113,9 @@ class RCNN(nn.Module):
         self.odam_enabled = True
         self.odam_inference = False
         self.last_odam_filter_stats = {
+            "num_fg": 0,
+            "num_preselected": 0,
+            "num_budget_kept": 0,
             "candidates": 0,
             "kept": 0,
             "keep_ratio": 0.0,
@@ -1124,6 +1127,16 @@ class RCNN(nn.Module):
             "reliability_score_tau": 0.0,
             "reliability_budget_fraction": 1.0,
             "reliability_budget_keep_ratio": 1.0,
+            "reliability_pre_mean": 0.0,
+            "reliability_pre_std": 0.0,
+            "reliability_pre_p10": 0.0,
+            "reliability_pre_p50": 0.0,
+            "reliability_pre_p90": 0.0,
+            "reliability_kept_mean": 0.0,
+            "reliability_kept_std": 0.0,
+            "reliability_kept_p10": 0.0,
+            "reliability_kept_p50": 0.0,
+            "reliability_kept_p90": 0.0,
             "roi_iou_mean": 0.0,
             "roi_score_mean": 0.0,
             "odam_loss_raw": 0.0,
@@ -1166,6 +1179,9 @@ class RCNN(nn.Module):
     ):
         config = self.config
         self.last_odam_filter_stats = {
+            "num_fg": 0,
+            "num_preselected": 0,
+            "num_budget_kept": 0,
             "candidates": 0,
             "kept": 0,
             "keep_ratio": 0.0,
@@ -1177,6 +1193,16 @@ class RCNN(nn.Module):
             "reliability_score_tau": 0.0,
             "reliability_budget_fraction": 1.0,
             "reliability_budget_keep_ratio": 1.0,
+            "reliability_pre_mean": 0.0,
+            "reliability_pre_std": 0.0,
+            "reliability_pre_p10": 0.0,
+            "reliability_pre_p50": 0.0,
+            "reliability_pre_p90": 0.0,
+            "reliability_kept_mean": 0.0,
+            "reliability_kept_std": 0.0,
+            "reliability_kept_p10": 0.0,
+            "reliability_kept_p50": 0.0,
+            "reliability_kept_p90": 0.0,
             "roi_iou_mean": 0.0,
             "roi_score_mean": 0.0,
             "odam_loss_raw": 0.0,
@@ -1377,30 +1403,39 @@ class RCNN(nn.Module):
             num_candidates = int(odam_keep.numel())
             num_kept = int(odam_keep.sum().detach().cpu())
             num_preselected = int(preselect_keep.sum().detach().cpu())
+            budget_fraction = float(
+                getattr(config, "odam_reliability_budget_fraction", 1.0)
+            )
             budget_keep_ratio = (
                 float(num_kept) / float(max(num_preselected, 1))
             )
+            pre_reliability = reliability_all[preselect_keep]
             kept_reliability = reliability_all[odam_keep]
             kept_ious = pred_gt_ious[odam_keep]
             kept_scores = fg_scores[odam_keep]
             self.last_odam_filter_stats = {
+                "num_fg": num_candidates,
+                "num_preselected": num_preselected,
+                "num_budget_kept": num_kept,
                 "candidates": num_candidates,
                 "kept": num_kept,
                 "keep_ratio": (
                     float(num_kept) / float(max(num_candidates, 1))
+                ),
+                **odam_reliability_distribution(
+                    pre_reliability,
+                    "reliability_pre",
+                ),
+                **odam_reliability_distribution(
+                    kept_reliability,
+                    "reliability_kept",
                 ),
                 **odam_reliability_summary(
                     kept_reliability,
                     kept_ious,
                     kept_scores,
                     score_tau=score_tau_value,
-                    budget_fraction=float(
-                        getattr(
-                            config,
-                            "odam_reliability_budget_fraction",
-                            1.0,
-                        )
-                    ),
+                    budget_fraction=budget_fraction,
                     budget_keep_ratio=budget_keep_ratio,
                 ),
             }
@@ -2108,6 +2143,42 @@ def _stat_float(values: torch.Tensor, fn, default: float = 0.0) -> float:
     if values.numel() == 0:
         return default
     return float(fn(values).detach().cpu())
+
+
+def odam_reliability_distribution(
+    reliability: torch.Tensor,
+    prefix: str,
+) -> dict:
+    reliability = reliability.flatten().detach()
+    if reliability.numel() == 0:
+        return {
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_std": 0.0,
+            f"{prefix}_p10": 0.0,
+            f"{prefix}_p50": 0.0,
+            f"{prefix}_p90": 0.0,
+        }
+
+    rel_float = reliability.float()
+    return {
+        f"{prefix}_mean": _stat_float(rel_float, torch.mean),
+        f"{prefix}_std": _stat_float(
+            rel_float,
+            lambda value: torch.std(value, unbiased=False),
+        ),
+        f"{prefix}_p10": _stat_float(
+            rel_float,
+            lambda value: torch.quantile(value, 0.10),
+        ),
+        f"{prefix}_p50": _stat_float(
+            rel_float,
+            lambda value: torch.quantile(value, 0.50),
+        ),
+        f"{prefix}_p90": _stat_float(
+            rel_float,
+            lambda value: torch.quantile(value, 0.90),
+        ),
+    }
 
 
 def odam_reliability_summary(

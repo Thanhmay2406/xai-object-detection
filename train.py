@@ -1388,13 +1388,13 @@ EXPERIMENT_STAGE_PRESETS = {
         budget_enabled=True,
         budget_start=0.25,
         budget_end=0.50,
-        budget_min=1,
+        budget_min=2,
     ),
 }
 
 
 AUX_SAFETY_EPS = 1e-8
-METRICS_SCHEMA_VERSION = 5
+METRICS_SCHEMA_VERSION = 6
 GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 4
 
 
@@ -1418,7 +1418,15 @@ def _odam_reliability_budget_fraction_for_epoch(args, epoch: float) -> float:
     end = float(getattr(args, "odam_reliability_budget_end", 1.0))
     if int(getattr(args, "epochs", 1)) <= 1:
         return end
-    progress = float(epoch) / float(max(int(args.epochs) - 1, 1))
+    warmup_start = 0.0
+    if bool(getattr(args, "warmup_enabled", False)):
+        warmup_start = float(getattr(args, "dpga_warmup", 0))
+    if float(epoch) < warmup_start:
+        return start
+    progress = (
+        (float(epoch) - warmup_start)
+        / float(max((int(args.epochs) - 1) - warmup_start, 1.0))
+    )
     progress = min(max(progress, 0.0), 1.0)
     return start + (end - start) * progress
 
@@ -2049,6 +2057,9 @@ def train_one_epoch(
         "raw_loss_sum": 0.0,
         "loss_proxy": 0.0,
         "loss_total_objective": 0.0,
+        "odam_num_fg": 0.0,
+        "odam_num_preselected": 0.0,
+        "odam_num_budget_kept": 0.0,
         "odam_num_candidates": 0.0,
         "odam_num_kept": 0.0,
         "odam_keep_ratio": 0.0,
@@ -2060,6 +2071,16 @@ def train_one_epoch(
         "odam_reliability_score_tau": 0.0,
         "odam_reliability_budget_fraction": 0.0,
         "odam_reliability_budget_keep_ratio": 0.0,
+        "odam_reliability_pre_mean": 0.0,
+        "odam_reliability_pre_std": 0.0,
+        "odam_reliability_pre_p10": 0.0,
+        "odam_reliability_pre_p50": 0.0,
+        "odam_reliability_pre_p90": 0.0,
+        "odam_reliability_kept_mean": 0.0,
+        "odam_reliability_kept_std": 0.0,
+        "odam_reliability_kept_p10": 0.0,
+        "odam_reliability_kept_p50": 0.0,
+        "odam_reliability_kept_p90": 0.0,
         "odam_roi_iou_mean": 0.0,
         "odam_roi_score_mean": 0.0,
         "odam_loss_raw": 0.0,
@@ -2267,6 +2288,21 @@ def train_one_epoch(
             "last_odam_filter_stats",
             {},
         )
+        odam_num_fg = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("num_fg", 0.0))
+            )
+        )
+        odam_num_preselected = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("num_preselected", 0.0))
+            )
+        )
+        odam_num_budget_kept = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("num_budget_kept", 0.0))
+            )
+        )
         odam_num_candidates = reduce_mean(
             loss_det.new_tensor(
                 float(odam_filter_stats.get("candidates", 0.0))
@@ -2326,6 +2362,56 @@ def train_one_epoch(
                 )
             )
         )
+        odam_reliability_pre_mean = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_pre_mean", 0.0))
+            )
+        )
+        odam_reliability_pre_std = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_pre_std", 0.0))
+            )
+        )
+        odam_reliability_pre_p10 = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_pre_p10", 0.0))
+            )
+        )
+        odam_reliability_pre_p50 = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_pre_p50", 0.0))
+            )
+        )
+        odam_reliability_pre_p90 = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_pre_p90", 0.0))
+            )
+        )
+        odam_reliability_kept_mean = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_kept_mean", 0.0))
+            )
+        )
+        odam_reliability_kept_std = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_kept_std", 0.0))
+            )
+        )
+        odam_reliability_kept_p10 = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_kept_p10", 0.0))
+            )
+        )
+        odam_reliability_kept_p50 = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_kept_p50", 0.0))
+            )
+        )
+        odam_reliability_kept_p90 = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_kept_p90", 0.0))
+            )
+        )
         odam_roi_iou_mean = reduce_mean(
             loss_det.new_tensor(
                 float(odam_filter_stats.get("roi_iou_mean", 0.0))
@@ -2378,6 +2464,15 @@ def train_one_epoch(
             totals["loss_total_objective"] += float(
                 loss_total_objective_reduced.cpu()
             )
+        totals["odam_num_fg"] += float(
+            odam_num_fg.cpu()
+        )
+        totals["odam_num_preselected"] += float(
+            odam_num_preselected.cpu()
+        )
+        totals["odam_num_budget_kept"] += float(
+            odam_num_budget_kept.cpu()
+        )
         totals["odam_num_candidates"] += float(
             odam_num_candidates.cpu()
         )
@@ -2410,6 +2505,36 @@ def train_one_epoch(
         )
         totals["odam_reliability_budget_keep_ratio"] += float(
             odam_reliability_budget_keep_ratio.cpu()
+        )
+        totals["odam_reliability_pre_mean"] += float(
+            odam_reliability_pre_mean.cpu()
+        )
+        totals["odam_reliability_pre_std"] += float(
+            odam_reliability_pre_std.cpu()
+        )
+        totals["odam_reliability_pre_p10"] += float(
+            odam_reliability_pre_p10.cpu()
+        )
+        totals["odam_reliability_pre_p50"] += float(
+            odam_reliability_pre_p50.cpu()
+        )
+        totals["odam_reliability_pre_p90"] += float(
+            odam_reliability_pre_p90.cpu()
+        )
+        totals["odam_reliability_kept_mean"] += float(
+            odam_reliability_kept_mean.cpu()
+        )
+        totals["odam_reliability_kept_std"] += float(
+            odam_reliability_kept_std.cpu()
+        )
+        totals["odam_reliability_kept_p10"] += float(
+            odam_reliability_kept_p10.cpu()
+        )
+        totals["odam_reliability_kept_p50"] += float(
+            odam_reliability_kept_p50.cpu()
+        )
+        totals["odam_reliability_kept_p90"] += float(
+            odam_reliability_kept_p90.cpu()
         )
         totals["odam_roi_iou_mean"] += float(
             odam_roi_iou_mean.cpu()
@@ -2499,6 +2624,9 @@ CSV_FIELDS = [
     "raw_loss_sum",
     "loss_proxy",
     "loss_total_objective",
+    "odam_num_fg",
+    "odam_num_preselected",
+    "odam_num_budget_kept",
     "odam_num_candidates",
     "odam_num_kept",
     "odam_keep_ratio",
@@ -2510,6 +2638,16 @@ CSV_FIELDS = [
     "odam_reliability_score_tau",
     "odam_reliability_budget_fraction",
     "odam_reliability_budget_keep_ratio",
+    "odam_reliability_pre_mean",
+    "odam_reliability_pre_std",
+    "odam_reliability_pre_p10",
+    "odam_reliability_pre_p50",
+    "odam_reliability_pre_p90",
+    "odam_reliability_kept_mean",
+    "odam_reliability_kept_std",
+    "odam_reliability_kept_p10",
+    "odam_reliability_kept_p50",
+    "odam_reliability_kept_p90",
     "odam_roi_iou_mean",
     "odam_roi_score_mean",
     "odam_loss_raw",

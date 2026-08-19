@@ -106,6 +106,58 @@ class ODAMFilteringTest(unittest.TestCase):
 
         self.assertEqual(keep.tolist(), [False, True, True, True, False])
 
+    def test_reliability_budget_fraction_25_keeps_top_two_when_available(self):
+        reliability = torch.tensor([0.1, 0.9, 0.4, 0.8])
+        ids = torch.zeros(4, dtype=torch.long)
+        candidate_mask = torch.ones(4, dtype=torch.bool)
+
+        keep = network.odam_reliability_budget_mask(
+            reliability=reliability,
+            batch_ids=ids,
+            gt_ids=ids,
+            candidate_mask=candidate_mask,
+            enabled=True,
+            fraction=0.25,
+            min_keep=2,
+        )
+
+        self.assertEqual(keep.tolist(), [False, True, False, True])
+
+    def test_reliability_budget_fraction_50_keeps_half_per_group(self):
+        reliability = torch.tensor([0.1, 0.9, 0.4, 0.8])
+        ids = torch.zeros(4, dtype=torch.long)
+        candidate_mask = torch.ones(4, dtype=torch.bool)
+
+        keep = network.odam_reliability_budget_mask(
+            reliability=reliability,
+            batch_ids=ids,
+            gt_ids=ids,
+            candidate_mask=candidate_mask,
+            enabled=True,
+            fraction=0.50,
+            min_keep=2,
+        )
+
+        self.assertEqual(keep.tolist(), [False, True, False, True])
+
+    def test_reliability_budget_separates_images_with_same_gt_id(self):
+        reliability = torch.tensor([0.1, 0.9, 0.2, 0.8])
+        batch_ids = torch.tensor([0, 0, 1, 1])
+        gt_ids = torch.tensor([3, 3, 3, 3])
+        candidate_mask = torch.ones(4, dtype=torch.bool)
+
+        keep = network.odam_reliability_budget_mask(
+            reliability=reliability,
+            batch_ids=batch_ids,
+            gt_ids=gt_ids,
+            candidate_mask=candidate_mask,
+            enabled=True,
+            fraction=0.25,
+            min_keep=1,
+        )
+
+        self.assertEqual(keep.tolist(), [False, True, False, True])
+
     def test_reliability_budget_respects_candidate_mask(self):
         reliability = torch.tensor([0.9, 0.8, 0.7])
         ids = torch.tensor([0, 0, 0])
@@ -122,6 +174,19 @@ class ODAMFilteringTest(unittest.TestCase):
         )
 
         self.assertEqual(keep.tolist(), [False, True, True])
+
+    def test_reliability_budget_handles_zero_candidate(self):
+        keep = network.odam_reliability_budget_mask(
+            reliability=torch.tensor([0.9, 0.8]),
+            batch_ids=torch.tensor([0, 0]),
+            gt_ids=torch.tensor([0, 0]),
+            candidate_mask=torch.tensor([False, False]),
+            enabled=True,
+            fraction=0.25,
+            min_keep=2,
+        )
+
+        self.assertEqual(keep.tolist(), [False, False])
 
     def test_reliability_weighted_match_loss_downweights_noisy_roi(self):
         dams = torch.tensor(
@@ -240,6 +305,75 @@ class ODAMFilteringTest(unittest.TestCase):
         self.assertEqual(float(losses["loss_rcnn_match"].detach()), 0.0)
         self.assertEqual(rcnn.last_odam_filter_stats["candidates"], 1)
         self.assertEqual(rcnn.last_odam_filter_stats["kept"], 0)
+
+    def test_e7_forward_backward_is_finite_and_logs_selection_stats(self):
+        config = SimpleNamespace(
+            bbox_normalize_stds=(0.1, 0.1, 0.2, 0.2),
+            bbox_normalize_means=(0.0, 0.0, 0.0, 0.0),
+            num_classes=2,
+            rcnn_smooth_l1_beta=1.0,
+            pred_cls_threshold=0.05,
+            odam_filtering=True,
+            odam_min_iou=0.5,
+            odam_min_score=0.0,
+            odam_reliability=True,
+            odam_reliability_iou_tau=0.6,
+            odam_reliability_iou_temp=0.1,
+            odam_reliability_score_tau=0.7,
+            odam_reliability_score_temp=0.1,
+            odam_reliability_adaptive_score_tau=True,
+            odam_reliability_score_percentile=0.70,
+            odam_reliability_budget_enabled=True,
+            odam_reliability_budget_fraction=0.25,
+            odam_reliability_budget_min=2,
+        )
+        rcnn = network.RCNN(config)
+        rcnn.train()
+        rcnn.set_odam_enabled(True)
+        with torch.no_grad():
+            rcnn.pred_delta.weight.zero_()
+            rcnn.pred_delta.bias.zero_()
+
+        fpn_fms = [
+            torch.zeros(1, 256, 8, 8),
+            torch.randn(1, 256, 64, 64, requires_grad=True),
+            torch.randn(1, 256, 32, 32, requires_grad=True),
+            torch.randn(1, 256, 16, 16, requires_grad=True),
+            torch.randn(1, 256, 8, 8, requires_grad=True),
+        ]
+        rcnn_rois = torch.tensor(
+            [
+                [0.0, 16.0, 16.0, 80.0, 80.0],
+                [0.0, 18.0, 18.0, 82.0, 82.0],
+            ]
+        )
+        labels = torch.tensor([1, 1])
+        bbox_targets = torch.zeros(2, 4)
+        assigned_gts = torch.tensor([0, 0])
+
+        losses = rcnn(
+            fpn_fms,
+            rcnn_rois,
+            labels=labels,
+            bbox_targets=bbox_targets,
+            assigned_gts=assigned_gts,
+        )
+        objective = (
+            losses["loss_rcnn_loc"]
+            + losses["loss_rcnn_cls"]
+            + losses["loss_rcnn_match"]
+        )
+        objective.backward()
+
+        stats = rcnn.last_odam_filter_stats
+        self.assertTrue(torch.isfinite(objective))
+        self.assertTrue(torch.isfinite(losses["loss_rcnn_match"]))
+        self.assertEqual(stats["num_fg"], 2)
+        self.assertEqual(stats["num_preselected"], 2)
+        self.assertEqual(stats["num_budget_kept"], 2)
+        self.assertIn("reliability_pre_p50", stats)
+        self.assertIn("reliability_kept_p50", stats)
+        self.assertGreaterEqual(stats["reliability_score_tau"], 0.0)
 
     def test_detection_losses_are_computed_before_odam_filtering(self):
         source = inspect.getsource(network.RCNN.forward)

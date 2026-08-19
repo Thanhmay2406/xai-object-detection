@@ -128,7 +128,34 @@ class ExperimentStageTest(unittest.TestCase):
         self.assertTrue(args.odam_reliability_budget_enabled)
         self.assertAlmostEqual(args.odam_reliability_budget_start, 0.25)
         self.assertAlmostEqual(args.odam_reliability_budget_end, 0.50)
-        self.assertEqual(args.odam_reliability_budget_min, 1)
+        self.assertEqual(args.odam_reliability_budget_min, 2)
+
+    def test_e7_budget_schedule_starts_after_warmup(self):
+        args = self._parse(
+            "--method",
+            "dpga",
+            "--experiment-stage",
+            "E7",
+            "--epochs",
+            "30",
+        )
+
+        self.assertAlmostEqual(
+            train._odam_reliability_budget_fraction_for_epoch(args, 0),
+            0.25,
+        )
+        self.assertAlmostEqual(
+            train._odam_reliability_budget_fraction_for_epoch(args, 3),
+            0.25,
+        )
+        self.assertAlmostEqual(
+            train._odam_reliability_budget_fraction_for_epoch(args, 4),
+            0.25,
+        )
+        self.assertAlmostEqual(
+            train._odam_reliability_budget_fraction_for_epoch(args, 29),
+            0.50,
+        )
 
     def test_stage_rejects_legacy_dpga_ablation_flags(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):

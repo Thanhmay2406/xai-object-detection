@@ -34,21 +34,22 @@ ODAM/DPGA notes:
 Progressive ODAM/DPGA ablation:
 
 Use `--experiment-stage` to run one progressive stage at a time. E0-E2 are
-ODAM scalarization stages and should be run with `--method odam`; E3-E6 use
+ODAM scalarization stages and should be run with `--method odam`; E3-E7 use
 DPGA gradient composition and should be run with `--method dpga`.
 In stage mode, all stages use the same maximum auxiliary ODAM weight from
 `--odam-weight`; `--dpga-alpha` is kept for legacy DPGA runs without
 `--experiment-stage`.
 
-| Stage | Warm-up | Hard filtering | Soft reliability | Projection | Norm-cap | Gate |
-|------|------|------|------|------|------|------|
-| E0 | No | No | No | No | No | No |
-| E1 | Yes | No | No | No | No | No |
-| E2 | Yes | Yes | No | No | No | No |
-| E3 | Yes | Yes | No | Yes | No | No |
-| E4 | Yes | Yes | No | Yes | Yes | No |
-| E5 | Yes | Yes | No | Yes | Yes | Yes |
-| E6 | Yes | No | Yes | Yes | Yes | Yes |
+| Stage | Warm-up | Hard filtering | Soft reliability | Adaptive score tau | Reliability budget | Projection | Norm-cap | Gate |
+|------|------|------|------|------|------|------|------|------|
+| E0 | No | No | No | No | No | No | No | No |
+| E1 | Yes | No | No | No | No | No | No | No |
+| E2 | Yes | Yes | No | No | No | No | No | No |
+| E3 | Yes | Yes | No | No | No | Yes | No | No |
+| E4 | Yes | Yes | No | No | No | Yes | Yes | No |
+| E5 | Yes | Yes | No | No | No | Yes | Yes | Yes |
+| E6 | Yes | No | Yes | No | No | Yes | Yes | Yes |
+| E7 | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 
 Example stage commands:
 
@@ -60,6 +61,7 @@ python train.py --method dpga --experiment-stage E3 ...
 python train.py --method dpga --experiment-stage E4 ...
 python train.py --method dpga --experiment-stage E5 ...
 python train.py --method dpga --experiment-stage E6 ...
+python train.py --method dpga --experiment-stage E7 ...
 ```
 
 E2-E5 enable ODAM-only hard proposal quality filtering. The default thresholds are
@@ -71,14 +73,20 @@ confidence. The default soft transition parameters are
 `--odam-reliability-iou-tau 0.6`, `--odam-reliability-iou-temp 0.1`,
 `--odam-reliability-score-tau 0.7`, and
 `--odam-reliability-score-temp 0.1`.
+E7 keeps the E5/E6 DPGA controller, restores light ODAM-only IoU filtering
+with `--odam-min-iou 0.5` and `--odam-min-score 0.0`, computes score
+reliability from the mini-batch candidate score percentile
+`--odam-reliability-score-percentile 0.70`, and applies a per-image/per-GT
+reliability budget from 25% to 50% after warm-up with at least two proposals
+kept when an object has two or more candidates.
 
-See `experiment_commands.md` for E0-E6 command templates, environment capture,
+See `experiment_commands.md` for E0-E7 command templates, environment capture,
 and the recommended pre-flight smoke checks.
 
 Offline metric reports:
 
 After training has produced run directories such as `outputs/e0` through
-`outputs/e6`, use `metrics.py` to aggregate detection, gradient, XAI, and
+`outputs/e7`, use `metrics.py` to aggregate detection, gradient, XAI, and
 runtime tables from saved artifacts:
 
 ```bash
@@ -109,7 +117,7 @@ checkpoint forward pass. This is validation-only and does not retrain:
 ```bash
 python export_xai_metrics.py \
   --outputs outputs \
-  --runs e0 e1 e2 e3 e4 e5 e6 \
+  --runs e0 e1 e2 e3 e4 e5 e6 e7 \
   --checkpoint best \
   --val-images data/coco/valid \
   --val-ann data/coco/valid/_annotations.coco.json \

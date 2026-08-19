@@ -340,7 +340,14 @@ def summarize_training_metrics(run: RunArtifact, rows: Sequence[Dict[str, str]])
         out[f"mean_{metric}"] = mean(to_float(row.get(metric)) for row in rows)
         out[f"final_{metric}"] = final_metric(rows, metric)
 
-    for metric in ["odam_num_candidates", "odam_num_kept", "odam_keep_ratio"]:
+    for metric in [
+        "odam_num_fg",
+        "odam_num_preselected",
+        "odam_num_budget_kept",
+        "odam_num_candidates",
+        "odam_num_kept",
+        "odam_keep_ratio",
+    ]:
         out[f"mean_{metric}"] = mean(to_float(row.get(metric)) for row in rows)
         out[f"final_{metric}"] = final_metric(rows, metric)
 
@@ -353,6 +360,16 @@ def summarize_training_metrics(run: RunArtifact, rows: Sequence[Dict[str, str]])
         "odam_reliability_score_tau",
         "odam_reliability_budget_fraction",
         "odam_reliability_budget_keep_ratio",
+        "odam_reliability_pre_mean",
+        "odam_reliability_pre_std",
+        "odam_reliability_pre_p10",
+        "odam_reliability_pre_p50",
+        "odam_reliability_pre_p90",
+        "odam_reliability_kept_mean",
+        "odam_reliability_kept_std",
+        "odam_reliability_kept_p10",
+        "odam_reliability_kept_p50",
+        "odam_reliability_kept_p90",
         "odam_roi_iou_mean",
         "odam_roi_score_mean",
         "odam_loss_raw",
