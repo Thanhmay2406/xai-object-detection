@@ -1121,6 +1121,9 @@ class RCNN(nn.Module):
             "reliability_p10": 0.0,
             "reliability_p50": 0.0,
             "reliability_p90": 0.0,
+            "reliability_score_tau": 0.0,
+            "reliability_budget_fraction": 1.0,
+            "reliability_budget_keep_ratio": 1.0,
             "roi_iou_mean": 0.0,
             "roi_score_mean": 0.0,
             "odam_loss_raw": 0.0,
@@ -1171,6 +1174,9 @@ class RCNN(nn.Module):
             "reliability_p10": 0.0,
             "reliability_p50": 0.0,
             "reliability_p90": 0.0,
+            "reliability_score_tau": 0.0,
+            "reliability_budget_fraction": 1.0,
+            "reliability_budget_keep_ratio": 1.0,
             "roi_iou_mean": 0.0,
             "roi_score_mean": 0.0,
             "odam_loss_raw": 0.0,
@@ -1307,6 +1313,34 @@ class RCNN(nn.Module):
                 fg_inds_all,
                 fg_gt_classes,
             ]
+            preselect_keep = odam_quality_filter_mask(
+                pred_gt_iou=pred_gt_ious,
+                class_scores=fg_scores,
+                enabled=bool(getattr(config, "odam_filtering", False)),
+                min_iou=float(getattr(config, "odam_min_iou", 0.7)),
+                min_score=float(getattr(config, "odam_min_score", 0.9)),
+            )
+            score_tau_tensor = odam_score_tau(
+                fg_scores[preselect_keep],
+                enabled=bool(
+                    getattr(
+                        config,
+                        "odam_reliability_adaptive_score_tau",
+                        False,
+                    )
+                ),
+                percentile=float(
+                    getattr(
+                        config,
+                        "odam_reliability_score_percentile",
+                        0.70,
+                    )
+                ),
+                default_tau=float(
+                    getattr(config, "odam_reliability_score_tau", 0.7)
+                ),
+            )
+            score_tau_value = float(score_tau_tensor.detach().cpu())
             reliability_all = odam_reliability_weights(
                 pred_gt_iou=pred_gt_ious,
                 class_scores=fg_scores,
@@ -1317,22 +1351,35 @@ class RCNN(nn.Module):
                 iou_temperature=float(
                     getattr(config, "odam_reliability_iou_temp", 0.1)
                 ),
-                score_tau=float(
-                    getattr(config, "odam_reliability_score_tau", 0.7)
-                ),
+                score_tau=score_tau_value,
                 score_temperature=float(
                     getattr(config, "odam_reliability_score_temp", 0.1)
                 ),
             )
-            odam_keep = odam_quality_filter_mask(
-                pred_gt_iou=pred_gt_ious,
-                class_scores=fg_scores,
-                enabled=bool(getattr(config, "odam_filtering", False)),
-                min_iou=float(getattr(config, "odam_min_iou", 0.7)),
-                min_score=float(getattr(config, "odam_min_score", 0.9)),
+            all_gt_ids = assigned_gts[fg_masks]
+            all_batch_ids = rcnn_rois[fg_masks, 0].long()
+            budget_keep = odam_reliability_budget_mask(
+                reliability=reliability_all,
+                batch_ids=all_batch_ids,
+                gt_ids=all_gt_ids,
+                candidate_mask=preselect_keep,
+                enabled=bool(
+                    getattr(config, "odam_reliability_budget_enabled", False)
+                ),
+                fraction=float(
+                    getattr(config, "odam_reliability_budget_fraction", 1.0)
+                ),
+                min_keep=int(
+                    getattr(config, "odam_reliability_budget_min", 1)
+                ),
             )
+            odam_keep = budget_keep
             num_candidates = int(odam_keep.numel())
             num_kept = int(odam_keep.sum().detach().cpu())
+            num_preselected = int(preselect_keep.sum().detach().cpu())
+            budget_keep_ratio = (
+                float(num_kept) / float(max(num_preselected, 1))
+            )
             kept_reliability = reliability_all[odam_keep]
             kept_ious = pred_gt_ious[odam_keep]
             kept_scores = fg_scores[odam_keep]
@@ -1346,6 +1393,15 @@ class RCNN(nn.Module):
                     kept_reliability,
                     kept_ious,
                     kept_scores,
+                    score_tau=score_tau_value,
+                    budget_fraction=float(
+                        getattr(
+                            config,
+                            "odam_reliability_budget_fraction",
+                            1.0,
+                        )
+                    ),
+                    budget_keep_ratio=budget_keep_ratio,
                 ),
             }
             if num_kept == 0:
@@ -1924,6 +1980,27 @@ def odam_quality_filter_mask(
     )
 
 
+def odam_score_tau(
+    class_scores: torch.Tensor,
+    enabled: bool,
+    percentile: float,
+    default_tau: float,
+) -> torch.Tensor:
+    class_scores = class_scores.flatten().detach()
+    if not 0.0 <= float(percentile) <= 1.0:
+        raise ValueError("percentile must be in [0, 1]")
+    if class_scores.numel() == 0 or not enabled:
+        return torch.as_tensor(
+            float(default_tau),
+            dtype=class_scores.dtype,
+            device=class_scores.device,
+        )
+    return torch.quantile(class_scores.float(), float(percentile)).to(
+        dtype=class_scores.dtype,
+        device=class_scores.device,
+    )
+
+
 def odam_reliability_weights(
     pred_gt_iou: torch.Tensor,
     class_scores: torch.Tensor,
@@ -1968,6 +2045,65 @@ def odam_reliability_weights(
     return (iou_weight * score_weight).detach()
 
 
+def odam_reliability_budget_mask(
+    reliability: torch.Tensor,
+    batch_ids: torch.Tensor,
+    gt_ids: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    enabled: bool,
+    fraction: float,
+    min_keep: int,
+) -> torch.Tensor:
+    reliability = reliability.flatten().detach()
+    batch_ids = batch_ids.flatten().long()
+    gt_ids = gt_ids.flatten().long()
+    candidate_mask = candidate_mask.flatten().bool()
+
+    if (
+        reliability.numel() != batch_ids.numel()
+        or reliability.numel() != gt_ids.numel()
+        or reliability.numel() != candidate_mask.numel()
+    ):
+        raise ValueError("reliability, ids, and candidate_mask sizes must match")
+    if not 0.0 <= float(fraction) <= 1.0:
+        raise ValueError("fraction must be in [0, 1]")
+    if int(min_keep) < 1:
+        raise ValueError("min_keep must be >= 1")
+    if not enabled:
+        return candidate_mask.clone()
+
+    keep = torch.zeros_like(candidate_mask)
+    valid_indices = candidate_mask.nonzero(as_tuple=True)[0]
+    if valid_indices.numel() == 0:
+        return keep
+
+    keys = torch.stack(
+        [
+            batch_ids[valid_indices],
+            gt_ids[valid_indices],
+        ],
+        dim=1,
+    )
+    unique_keys = torch.unique(keys, dim=0)
+
+    for key in unique_keys:
+        same = (
+            (batch_ids[valid_indices] == key[0])
+            & (gt_ids[valid_indices] == key[1])
+        )
+        group_indices = valid_indices[same]
+        group_count = int(group_indices.numel())
+        if group_count == 0:
+            continue
+        k = int(math.ceil(float(fraction) * float(group_count)))
+        k = max(int(min_keep), k)
+        k = min(group_count, k)
+        _, order = reliability[group_indices].topk(k, sorted=False)
+        keep[group_indices[order]] = True
+
+    return keep
+
+
 def _stat_float(values: torch.Tensor, fn, default: float = 0.0) -> float:
     if values.numel() == 0:
         return default
@@ -1978,6 +2114,9 @@ def odam_reliability_summary(
     reliability: torch.Tensor,
     pred_gt_iou: torch.Tensor,
     class_scores: torch.Tensor,
+    score_tau: Optional[float] = None,
+    budget_fraction: float = 1.0,
+    budget_keep_ratio: float = 1.0,
 ) -> dict:
     reliability = reliability.flatten().detach()
     pred_gt_iou = pred_gt_iou.flatten().detach()
@@ -1990,6 +2129,11 @@ def odam_reliability_summary(
             "reliability_p10": 0.0,
             "reliability_p50": 0.0,
             "reliability_p90": 0.0,
+            "reliability_score_tau": (
+                0.0 if score_tau is None else float(score_tau)
+            ),
+            "reliability_budget_fraction": float(budget_fraction),
+            "reliability_budget_keep_ratio": float(budget_keep_ratio),
             "roi_iou_mean": 0.0,
             "roi_score_mean": 0.0,
             "effective_odam_rois": 0.0,
@@ -2018,6 +2162,11 @@ def odam_reliability_summary(
             rel_float,
             lambda value: torch.quantile(value, 0.90),
         ),
+        "reliability_score_tau": (
+            0.0 if score_tau is None else float(score_tau)
+        ),
+        "reliability_budget_fraction": float(budget_fraction),
+        "reliability_budget_keep_ratio": float(budget_keep_ratio),
         "roi_iou_mean": _stat_float(pred_gt_iou.float(), torch.mean),
         "roi_score_mean": _stat_float(class_scores.float(), torch.mean),
         "effective_odam_rois": float(rel_float.sum().detach().cpu()),
@@ -2268,6 +2417,24 @@ def validate_config(config):
         raise ValueError("odam_reliability_iou_temp must be > 0")
     if float(getattr(config, "odam_reliability_score_temp", 0.1)) <= 0.0:
         raise ValueError("odam_reliability_score_temp must be > 0")
+    if not 0.0 <= float(
+        getattr(config, "odam_reliability_score_percentile", 0.70)
+    ) <= 1.0:
+        raise ValueError("odam_reliability_score_percentile must be in [0, 1]")
+    if not 0.0 <= float(
+        getattr(config, "odam_reliability_budget_start", 1.0)
+    ) <= 1.0:
+        raise ValueError("odam_reliability_budget_start must be in [0, 1]")
+    if not 0.0 <= float(
+        getattr(config, "odam_reliability_budget_end", 1.0)
+    ) <= 1.0:
+        raise ValueError("odam_reliability_budget_end must be in [0, 1]")
+    if not 0.0 <= float(
+        getattr(config, "odam_reliability_budget_fraction", 1.0)
+    ) <= 1.0:
+        raise ValueError("odam_reliability_budget_fraction must be in [0, 1]")
+    if int(getattr(config, "odam_reliability_budget_min", 1)) < 1:
+        raise ValueError("odam_reliability_budget_min must be >= 1")
 
     return True
 

@@ -29,6 +29,7 @@ class ExperimentStageTest(unittest.TestCase):
             "E4": (True, True, False, True, True, False),
             "E5": (True, True, False, True, True, True),
             "E6": (True, False, True, True, True, True),
+            "E7": (True, True, True, True, True, True),
         }
 
         for stage, values in expected.items():
@@ -103,6 +104,32 @@ class ExperimentStageTest(unittest.TestCase):
         self.assertAlmostEqual(args.odam_reliability_score_tau, 0.7)
         self.assertAlmostEqual(args.odam_reliability_score_temp, 0.1)
 
+    def test_e7_cli_sets_adaptive_selective_reliability(self):
+        args = self._parse(
+            "--method",
+            "dpga",
+            "--experiment-stage",
+            "E7",
+        )
+
+        self.assertTrue(args.warmup_enabled)
+        self.assertTrue(args.filtering_enabled)
+        self.assertTrue(args.odam_filtering)
+        self.assertTrue(args.reliability_enabled)
+        self.assertTrue(args.odam_reliability)
+        self.assertTrue(args.projection_enabled)
+        self.assertTrue(args.norm_cap_enabled)
+        self.assertTrue(args.gate_enabled)
+        self.assertEqual(args.dpga_ablation_label, "E7_incremental")
+        self.assertAlmostEqual(args.odam_min_iou, 0.5)
+        self.assertAlmostEqual(args.odam_min_score, 0.0)
+        self.assertTrue(args.odam_reliability_adaptive_score_tau)
+        self.assertAlmostEqual(args.odam_reliability_score_percentile, 0.70)
+        self.assertTrue(args.odam_reliability_budget_enabled)
+        self.assertAlmostEqual(args.odam_reliability_budget_start, 0.25)
+        self.assertAlmostEqual(args.odam_reliability_budget_end, 0.50)
+        self.assertEqual(args.odam_reliability_budget_min, 1)
+
     def test_stage_rejects_legacy_dpga_ablation_flags(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             self._parse(
@@ -145,7 +172,7 @@ class ExperimentStageTest(unittest.TestCase):
         self.assertEqual(args.dpga_ablation_label, "A2_projection")
 
     def test_stage_dpga_config_uses_shared_odam_weight_for_fairness(self):
-        for stage in ("E3", "E4", "E5", "E6"):
+        for stage in ("E3", "E4", "E5", "E6", "E7"):
             with self.subTest(stage=stage):
                 args = self._parse(
                     "--method",
@@ -197,7 +224,7 @@ class ExperimentStageTest(unittest.TestCase):
         )
 
     def test_e3_e4_e5_dpga_smoke_composition_is_finite(self):
-        for stage in ("E3", "E4", "E5", "E6"):
+        for stage in ("E3", "E4", "E5", "E6", "E7"):
             with self.subTest(stage=stage):
                 args = self._parse(
                     "--method",

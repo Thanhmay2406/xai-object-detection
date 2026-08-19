@@ -45,6 +45,7 @@ STAGE_ORDER = {
     "E4": 5,
     "E5": 6,
     "E6": 7,
+    "E7": 8,
 }
 
 HIGHER_IS_BETTER = {
@@ -133,7 +134,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional run directory names to include, for example: "
-            "baseline e0 e1 e2 e3 e4 e5 e6."
+            "baseline e0 e1 e2 e3 e4 e5 e6 e7."
         ),
     )
     parser.add_argument(
@@ -246,7 +247,7 @@ def normalize_run_label(run_dir: Path, experiment: Dict) -> str:
     lower = name.lower()
     if lower == "baseline":
         return "baseline"
-    if lower in {"e0", "e1", "e2", "e3", "e4", "e5", "e6"}:
+    if lower in {"e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7"}:
         return lower.upper()
     return name
 
@@ -349,6 +350,9 @@ def summarize_training_metrics(run: RunArtifact, rows: Sequence[Dict[str, str]])
         "odam_reliability_p10",
         "odam_reliability_p50",
         "odam_reliability_p90",
+        "odam_reliability_score_tau",
+        "odam_reliability_budget_fraction",
+        "odam_reliability_budget_keep_ratio",
         "odam_roi_iou_mean",
         "odam_roi_score_mean",
         "odam_loss_raw",

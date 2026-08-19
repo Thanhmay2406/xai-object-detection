@@ -222,6 +222,13 @@ class DetectorConfig:
     odam_reliability_iou_temp: float = 0.1
     odam_reliability_score_tau: float = 0.7
     odam_reliability_score_temp: float = 0.1
+    odam_reliability_adaptive_score_tau: bool = False
+    odam_reliability_score_percentile: float = 0.70
+    odam_reliability_budget_enabled: bool = False
+    odam_reliability_budget_start: float = 1.0
+    odam_reliability_budget_end: float = 1.0
+    odam_reliability_budget_fraction: float = 1.0
+    odam_reliability_budget_min: int = 1
 
     # Per-process batch size; set from CLI.
     train_batch_per_gpu: int = 1
@@ -1284,6 +1291,14 @@ class ExperimentStageConfig:
     projection_enabled: bool
     norm_cap_enabled: bool
     gate_enabled: bool
+    odam_min_iou: Optional[float] = None
+    odam_min_score: Optional[float] = None
+    adaptive_score_tau: bool = False
+    score_percentile: Optional[float] = None
+    budget_enabled: bool = False
+    budget_start: Optional[float] = None
+    budget_end: Optional[float] = None
+    budget_min: Optional[int] = None
 
     @property
     def requires_dpga(self) -> bool:
@@ -1358,11 +1373,28 @@ EXPERIMENT_STAGE_PRESETS = {
         norm_cap_enabled=True,
         gate_enabled=True,
     ),
+    "E7": ExperimentStageConfig(
+        "E7",
+        warmup_enabled=True,
+        filtering_enabled=True,
+        reliability_enabled=True,
+        projection_enabled=True,
+        norm_cap_enabled=True,
+        gate_enabled=True,
+        odam_min_iou=0.5,
+        odam_min_score=0.0,
+        adaptive_score_tau=True,
+        score_percentile=0.70,
+        budget_enabled=True,
+        budget_start=0.25,
+        budget_end=0.50,
+        budget_min=1,
+    ),
 }
 
 
 AUX_SAFETY_EPS = 1e-8
-METRICS_SCHEMA_VERSION = 4
+METRICS_SCHEMA_VERSION = 5
 GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 4
 
 
@@ -1371,12 +1403,24 @@ def resolve_experiment_stage_config(stage: str) -> ExperimentStageConfig:
         return EXPERIMENT_STAGE_PRESETS[str(stage)]
     except KeyError as exc:
         raise ValueError(
-            "--experiment-stage must be one of {E0,E1,E2,E3,E4,E5,E6}"
+            "--experiment-stage must be one of {E0,E1,E2,E3,E4,E5,E6,E7}"
         ) from exc
 
 
 def _cli_option_supplied(argv: Sequence[str], option: str) -> bool:
     return any(arg == option or arg.startswith(option + "=") for arg in argv)
+
+
+def _odam_reliability_budget_fraction_for_epoch(args, epoch: float) -> float:
+    if not bool(getattr(args, "odam_reliability_budget_enabled", False)):
+        return 1.0
+    start = float(getattr(args, "odam_reliability_budget_start", 1.0))
+    end = float(getattr(args, "odam_reliability_budget_end", 1.0))
+    if int(getattr(args, "epochs", 1)) <= 1:
+        return end
+    progress = float(epoch) / float(max(int(args.epochs) - 1, 1))
+    progress = min(max(progress, 0.0), 1.0)
+    return start + (end - start) * progress
 
 
 def _odam_weight_for_epoch(args, epoch: float) -> float:
@@ -1409,6 +1453,9 @@ def apply_experiment_stage_preset(
     args.projection_enabled = bool(args.dpga_projection)
     args.norm_cap_enabled = bool(args.dpga_norm_cap)
     args.gate_enabled = bool(args.dpga_gate)
+    args.odam_reliability_budget_fraction = (
+        _odam_reliability_budget_fraction_for_epoch(args, 0.0)
+    )
 
     if args.experiment_stage is None:
         args = apply_dpga_ablation_preset(args)
@@ -1479,6 +1526,27 @@ def apply_experiment_stage_preset(
     args.projection_enabled = stage.projection_enabled
     args.norm_cap_enabled = stage.norm_cap_enabled
     args.gate_enabled = stage.gate_enabled
+    if stage.odam_min_iou is not None:
+        args.odam_min_iou = float(stage.odam_min_iou)
+    if stage.odam_min_score is not None:
+        args.odam_min_score = float(stage.odam_min_score)
+    args.odam_reliability_adaptive_score_tau = bool(
+        stage.adaptive_score_tau
+    )
+    if stage.score_percentile is not None:
+        args.odam_reliability_score_percentile = float(
+            stage.score_percentile
+        )
+    args.odam_reliability_budget_enabled = bool(stage.budget_enabled)
+    if stage.budget_start is not None:
+        args.odam_reliability_budget_start = float(stage.budget_start)
+    if stage.budget_end is not None:
+        args.odam_reliability_budget_end = float(stage.budget_end)
+    if stage.budget_min is not None:
+        args.odam_reliability_budget_min = int(stage.budget_min)
+    args.odam_reliability_budget_fraction = (
+        _odam_reliability_budget_fraction_for_epoch(args, 0.0)
+    )
     args.dpga_ablation = None
     args.dpga_ablation_label = f"{stage.stage}_incremental"
     return args
@@ -1989,6 +2057,9 @@ def train_one_epoch(
         "odam_reliability_p10": 0.0,
         "odam_reliability_p50": 0.0,
         "odam_reliability_p90": 0.0,
+        "odam_reliability_score_tau": 0.0,
+        "odam_reliability_budget_fraction": 0.0,
+        "odam_reliability_budget_keep_ratio": 0.0,
         "odam_roi_iou_mean": 0.0,
         "odam_roi_score_mean": 0.0,
         "odam_loss_raw": 0.0,
@@ -2034,6 +2105,16 @@ def train_one_epoch(
         )
         dpga_epoch = fractional_epoch
         odam_weight = _odam_weight_for_epoch(args, fractional_epoch)
+        args.odam_reliability_budget_fraction = (
+            _odam_reliability_budget_fraction_for_epoch(
+                args,
+                fractional_epoch,
+            )
+        )
+        if hasattr(raw_model, "config"):
+            raw_model.config.odam_reliability_budget_fraction = (
+                args.odam_reliability_budget_fraction
+            )
         if args.method == "dpga" and dpga is not None:
             raw_model.set_odam_enabled(dpga.alpha(dpga_epoch) > 0.0)
         else:
@@ -2225,6 +2306,26 @@ def train_one_epoch(
                 float(odam_filter_stats.get("reliability_p90", 0.0))
             )
         )
+        odam_reliability_score_tau = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_score_tau", 0.0))
+            )
+        )
+        odam_reliability_budget_fraction = reduce_mean(
+            loss_det.new_tensor(
+                float(odam_filter_stats.get("reliability_budget_fraction", 0.0))
+            )
+        )
+        odam_reliability_budget_keep_ratio = reduce_mean(
+            loss_det.new_tensor(
+                float(
+                    odam_filter_stats.get(
+                        "reliability_budget_keep_ratio",
+                        0.0,
+                    )
+                )
+            )
+        )
         odam_roi_iou_mean = reduce_mean(
             loss_det.new_tensor(
                 float(odam_filter_stats.get("roi_iou_mean", 0.0))
@@ -2300,6 +2401,15 @@ def train_one_epoch(
         )
         totals["odam_reliability_p90"] += float(
             odam_reliability_p90.cpu()
+        )
+        totals["odam_reliability_score_tau"] += float(
+            odam_reliability_score_tau.cpu()
+        )
+        totals["odam_reliability_budget_fraction"] += float(
+            odam_reliability_budget_fraction.cpu()
+        )
+        totals["odam_reliability_budget_keep_ratio"] += float(
+            odam_reliability_budget_keep_ratio.cpu()
         )
         totals["odam_roi_iou_mean"] += float(
             odam_roi_iou_mean.cpu()
@@ -2397,6 +2507,9 @@ CSV_FIELDS = [
     "odam_reliability_p10",
     "odam_reliability_p50",
     "odam_reliability_p90",
+    "odam_reliability_score_tau",
+    "odam_reliability_budget_fraction",
+    "odam_reliability_budget_keep_ratio",
     "odam_roi_iou_mean",
     "odam_roi_score_mean",
     "odam_loss_raw",
@@ -2899,7 +3012,7 @@ def parse_args():
         default=None,
         help=(
             "Progressive ODAM/DPGA ablation stage. E0-E2 require "
-            "--method odam; E3-E6 require --method dpga."
+            "--method odam; E3-E7 require --method dpga."
         ),
     )
 
@@ -2994,7 +3107,7 @@ def parse_args():
         action="store_true",
         help=(
             "Enable soft reliability-aware ODAM weighting for legacy/manual "
-            "runs. Stage E6 sets this automatically."
+            "runs. Stages E6-E7 set this automatically."
         ),
     )
     parser.add_argument(
@@ -3016,6 +3129,43 @@ def parse_args():
         "--odam-reliability-score-temp",
         type=float,
         default=0.1,
+    )
+    parser.add_argument(
+        "--odam-reliability-adaptive-score-tau",
+        action="store_true",
+        help=(
+            "Use the current ODAM candidate score percentile as the soft "
+            "score reliability tau. Stage E7 sets this automatically."
+        ),
+    )
+    parser.add_argument(
+        "--odam-reliability-score-percentile",
+        type=float,
+        default=0.70,
+    )
+    parser.add_argument(
+        "--odam-reliability-budget",
+        dest="odam_reliability_budget_enabled",
+        action="store_true",
+        help=(
+            "Keep only a per-image/per-GT top reliability budget for ODAM. "
+            "Stage E7 sets this automatically."
+        ),
+    )
+    parser.add_argument(
+        "--odam-reliability-budget-start",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--odam-reliability-budget-end",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--odam-reliability-budget-min",
+        type=int,
+        default=1,
     )
 
     # DPGA schedule
@@ -3179,6 +3329,18 @@ def parse_args():
         raise ValueError("--odam-reliability-iou-temp must be > 0")
     if args.odam_reliability_score_temp <= 0:
         raise ValueError("--odam-reliability-score-temp must be > 0")
+    if not 0.0 <= args.odam_reliability_score_percentile <= 1.0:
+        raise ValueError(
+            "--odam-reliability-score-percentile must be in [0, 1]"
+        )
+    if not 0.0 <= args.odam_reliability_budget_start <= 1.0:
+        raise ValueError(
+            "--odam-reliability-budget-start must be in [0, 1]"
+        )
+    if not 0.0 <= args.odam_reliability_budget_end <= 1.0:
+        raise ValueError("--odam-reliability-budget-end must be in [0, 1]")
+    if args.odam_reliability_budget_min < 1:
+        raise ValueError("--odam-reliability-budget-min must be >= 1")
     if args.backbone_freeze_at not in (0, 1, 2):
         raise ValueError("--backbone-freeze-at must be one of {0, 1, 2}")
     if not 0.0 <= args.rpn_ignore_overlap <= 1.0:
@@ -3187,6 +3349,10 @@ def parse_args():
         raise ValueError("--odam-filtering is only valid for ODAM/DPGA runs.")
     if args.method == "baseline" and args.odam_reliability:
         raise ValueError("--odam-reliability is only valid for ODAM/DPGA runs.")
+    if args.method == "baseline" and args.odam_reliability_budget_enabled:
+        raise ValueError(
+            "--odam-reliability-budget is only valid for ODAM/DPGA runs."
+        )
     return apply_experiment_stage_preset(args, argv=argv)
 
 
@@ -3309,6 +3475,21 @@ def main():
         odam_reliability_iou_temp=args.odam_reliability_iou_temp,
         odam_reliability_score_tau=args.odam_reliability_score_tau,
         odam_reliability_score_temp=args.odam_reliability_score_temp,
+        odam_reliability_adaptive_score_tau=(
+            args.odam_reliability_adaptive_score_tau
+        ),
+        odam_reliability_score_percentile=(
+            args.odam_reliability_score_percentile
+        ),
+        odam_reliability_budget_enabled=(
+            args.odam_reliability_budget_enabled
+        ),
+        odam_reliability_budget_start=args.odam_reliability_budget_start,
+        odam_reliability_budget_end=args.odam_reliability_budget_end,
+        odam_reliability_budget_fraction=(
+            args.odam_reliability_budget_fraction
+        ),
+        odam_reliability_budget_min=args.odam_reliability_budget_min,
     )
     validate_config(config)
 
@@ -3372,6 +3553,24 @@ def main():
             "odam_reliability_iou_temp": args.odam_reliability_iou_temp,
             "odam_reliability_score_tau": args.odam_reliability_score_tau,
             "odam_reliability_score_temp": args.odam_reliability_score_temp,
+            "odam_reliability_adaptive_score_tau": (
+                args.odam_reliability_adaptive_score_tau
+            ),
+            "odam_reliability_score_percentile": (
+                args.odam_reliability_score_percentile
+            ),
+            "odam_reliability_budget_enabled": (
+                args.odam_reliability_budget_enabled
+            ),
+            "odam_reliability_budget_start": (
+                args.odam_reliability_budget_start
+            ),
+            "odam_reliability_budget_end": (
+                args.odam_reliability_budget_end
+            ),
+            "odam_reliability_budget_min": (
+                args.odam_reliability_budget_min
+            ),
             "projection_enabled": bool(args.projection_enabled),
             "norm_cap_enabled": bool(args.norm_cap_enabled),
             "gate_enabled": bool(args.gate_enabled),
@@ -3464,6 +3663,11 @@ def main():
             f"reliability_iou_temp={args.odam_reliability_iou_temp} "
             f"reliability_score_tau={args.odam_reliability_score_tau} "
             f"reliability_score_temp={args.odam_reliability_score_temp} "
+            f"adaptive_score_tau={int(bool(args.odam_reliability_adaptive_score_tau))} "
+            f"score_percentile={args.odam_reliability_score_percentile} "
+            f"budget={int(bool(args.odam_reliability_budget_enabled))} "
+            f"budget_start={args.odam_reliability_budget_start} "
+            f"budget_end={args.odam_reliability_budget_end} "
             f"projection={int(bool(args.projection_enabled))} "
             f"norm_cap={int(bool(args.norm_cap_enabled))} "
             f"gate={int(bool(args.gate_enabled))}"

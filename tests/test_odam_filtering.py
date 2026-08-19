@@ -69,6 +69,60 @@ class ODAMFilteringTest(unittest.TestCase):
         self.assertLess(float(reliability[0]), float(reliability[1]))
         self.assertLess(float(reliability[1]), float(reliability[2]))
 
+    def test_adaptive_score_tau_uses_candidate_percentile(self):
+        scores = torch.tensor([0.05, 0.10, 0.20, 0.40])
+
+        tau = network.odam_score_tau(
+            scores,
+            enabled=True,
+            percentile=0.50,
+            default_tau=0.70,
+        )
+        fixed = network.odam_score_tau(
+            scores,
+            enabled=False,
+            percentile=0.50,
+            default_tau=0.70,
+        )
+
+        self.assertAlmostEqual(float(tau), 0.15, places=6)
+        self.assertAlmostEqual(float(fixed), 0.70, places=6)
+
+    def test_reliability_budget_is_per_image_and_gt(self):
+        reliability = torch.tensor([0.1, 0.9, 0.4, 0.8, 0.2])
+        batch_ids = torch.tensor([0, 0, 0, 1, 1])
+        gt_ids = torch.tensor([1, 1, 2, 1, 1])
+        candidate_mask = torch.tensor([True, True, True, True, True])
+
+        keep = network.odam_reliability_budget_mask(
+            reliability=reliability,
+            batch_ids=batch_ids,
+            gt_ids=gt_ids,
+            candidate_mask=candidate_mask,
+            enabled=True,
+            fraction=0.50,
+            min_keep=1,
+        )
+
+        self.assertEqual(keep.tolist(), [False, True, True, True, False])
+
+    def test_reliability_budget_respects_candidate_mask(self):
+        reliability = torch.tensor([0.9, 0.8, 0.7])
+        ids = torch.tensor([0, 0, 0])
+        candidate_mask = torch.tensor([False, True, True])
+
+        keep = network.odam_reliability_budget_mask(
+            reliability=reliability,
+            batch_ids=ids,
+            gt_ids=ids,
+            candidate_mask=candidate_mask,
+            enabled=True,
+            fraction=1.0,
+            min_keep=1,
+        )
+
+        self.assertEqual(keep.tolist(), [False, True, True])
+
     def test_reliability_weighted_match_loss_downweights_noisy_roi(self):
         dams = torch.tensor(
             [
