@@ -3,8 +3,14 @@ import csv
 import json
 import os
 import random
+import sys
 import time
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import torch
@@ -699,6 +705,10 @@ def main(args):
             not args.no_coco_pretrained
         ),
 
+        pretrained_backbone=(
+            not args.no_backbone_pretrained
+        ),
+
         trainable_backbone_layers=(
             args.trainable_backbone_layers
         ),
@@ -1118,6 +1128,11 @@ def parse_args():
 
     parser.add_argument(
         "--no-coco-pretrained",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--no-backbone-pretrained",
         action="store_true",
     )
 
