@@ -5,9 +5,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 KAGGLE_DIR="${REPO_ROOT}/kaggle"
 METADATA="${KAGGLE_DIR}/kernel-metadata.json"
+VENV_PYTHON="${REPO_ROOT}/.venv/bin/python"
+KAGGLE_CLI="${REPO_ROOT}/.venv/bin/kaggle"
 
-if ! command -v kaggle >/dev/null 2>&1; then
-    echo "Error: Kaggle CLI is not installed. Install it with: pipx install kaggle" >&2
+if [[ ! -x "${VENV_PYTHON}" || ! -x "${KAGGLE_CLI}" ]]; then
+    echo "Error: expected project executables ${VENV_PYTHON} and ${KAGGLE_CLI}" >&2
     exit 1
 fi
 
@@ -21,6 +23,7 @@ if [[ "${KAGGLE_SKIP_GIT_CHECK:-0}" != "1" ]]; then
         .gitignore
         pyproject.toml
         requirements.txt
+        configs/historical_main_reference.json
         configs/kaggle.yaml
         kaggle/README.md
         kaggle/kernel-metadata.json
@@ -28,6 +31,7 @@ if [[ "${KAGGLE_SKIP_GIT_CHECK:-0}" != "1" ]]; then
         scripts/kaggle_run.sh
         scripts/kaggle_status.sh
         scripts/kaggle_pull.sh
+        scripts/reproduce_main.py
         src/xai_pruning
     )
     if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal -- "${DEPLOYMENT_PATHS[@]}")" ]]; then
@@ -52,7 +56,7 @@ if [[ "${KAGGLE_SKIP_GIT_CHECK:-0}" != "1" ]]; then
     fi
 fi
 
-METADATA_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["id"])' "${METADATA}")"
+METADATA_ID="$("${VENV_PYTHON}" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["id"])' "${METADATA}")"
 KERNEL_ID="${KAGGLE_KERNEL_ID:-${METADATA_ID}}"
 
 if [[ "${KERNEL_ID}" == *KAGGLE_USERNAME* || ! "${KERNEL_ID}" =~ ^[^/]+/[^/]+$ ]]; then
@@ -66,7 +70,7 @@ trap 'rm -rf -- "${STAGING_DIR}"' EXIT
 cp "${KAGGLE_DIR}/runner.py" "${KAGGLE_DIR}/kernel-metadata.json" "${KAGGLE_DIR}/README.md" "${STAGING_DIR}/"
 
 if [[ "${KERNEL_ID}" != "${METADATA_ID}" ]]; then
-    python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p, encoding="utf-8")); d["id"]=sys.argv[2]; json.dump(d, open(p, "w", encoding="utf-8"), indent=2); open(p, "a", encoding="utf-8").write("\n")' "${STAGING_DIR}/kernel-metadata.json" "${KERNEL_ID}"
+    "${VENV_PYTHON}" -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p, encoding="utf-8")); d["id"]=sys.argv[2]; json.dump(d, open(p, "w", encoding="utf-8"), indent=2); open(p, "a", encoding="utf-8").write("\n")' "${STAGING_DIR}/kernel-metadata.json" "${KERNEL_ID}"
 fi
 
 echo "Launching Kaggle kernel: ${KERNEL_ID}"
@@ -78,12 +82,12 @@ if [[ $# -gt 1 ]]; then
 fi
 
 if [[ $# -eq 1 ]]; then
-    if ! kaggle kernels push --help | grep -q -- '--accelerator'; then
+    if ! "${KAGGLE_CLI}" kernels push --help | grep -q -- '--accelerator'; then
         echo "Error: installed Kaggle CLI does not support --accelerator." >&2
         exit 1
     fi
     echo "Accelerator override: $1"
-    kaggle kernels push -p "${STAGING_DIR}" --accelerator "$1"
+    "${KAGGLE_CLI}" kernels push -p "${STAGING_DIR}" --accelerator "$1"
 else
-    kaggle kernels push -p "${STAGING_DIR}"
+    "${KAGGLE_CLI}" kernels push -p "${STAGING_DIR}"
 fi

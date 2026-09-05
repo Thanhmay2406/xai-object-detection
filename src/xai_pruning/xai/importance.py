@@ -6,6 +6,7 @@ import gc
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
@@ -531,3 +532,111 @@ def aggregate_multi_group_importance(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def _average_percentile_ranks(values) -> list[float]:
+    """Match pandas' ascending average-rank percentile on a one-dimensional vector."""
+
+    array = torch.as_tensor(values, dtype=torch.float64).cpu().numpy()
+    if array.ndim != 1:
+        raise ValueError("Importance values must be one-dimensional")
+    if len(array) == 0:
+        return []
+    if len(array) == 1:
+        return [0.0]
+
+    order = array.argsort(kind="mergesort")
+    ranks = np.empty(len(array), dtype=np.float64)
+    start = 0
+    while start < len(order):
+        end = start + 1
+        while end < len(order) and array[order[end]] == array[order[start]]:
+            end += 1
+        average_one_based_rank = ((start + 1) + end) / 2.0
+        ranks[order[start:end]] = average_one_based_rank
+        start = end
+    return ((ranks - 1.0) / (len(array) - 1.0)).tolist()
+
+
+def build_multi_group_importance_tables(
+    pruning_groups,
+    aggregate_importance: Mapping[str, Tensor],
+    eps: float = 1e-12,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Build the historical group, channel, and global-ranking artifact rows.
+
+    Normalization and tie handling intentionally match Pipeline 02/03:
+    each group is divided by its own maximum, within-group percentiles use
+    average ascending ranks, and the global table is ordered by normalized
+    importance, raw importance, group ID, then channel ID.
+    """
+
+    metadata_by_id = {str(group["group_id"]): group for group in pruning_groups}
+    if set(aggregate_importance) != set(metadata_by_id):
+        missing = sorted(set(metadata_by_id) - set(aggregate_importance))
+        extra = sorted(set(aggregate_importance) - set(metadata_by_id))
+        raise ValueError(f"Importance/group mismatch: missing={missing}, extra={extra}")
+
+    group_rows = []
+    channel_rows = []
+    for group_id, importance_tensor in aggregate_importance.items():
+        metadata = metadata_by_id[group_id]
+        values = importance_tensor.detach().cpu().double().numpy()
+        if values.ndim != 1 or len(values) == 0:
+            raise ValueError(f"Expected a non-empty channel vector for group={group_id}")
+        if not torch.isfinite(torch.from_numpy(values)).all():
+            raise ValueError(f"Non-finite importance in group={group_id}")
+
+        group_max = float(values.max())
+        group_mean = float(values.mean())
+        normalized = values / max(group_max, eps)
+        mean_ratio = values / max(group_mean, eps)
+        percentiles = _average_percentile_ranks(values)
+        zero_channels = int((values == 0.0).sum())
+        common = {
+            "group_id": group_id,
+            "stage": metadata["stage"],
+            "block": int(metadata["block"]),
+            "group_kind": metadata["group_kind"],
+            "producer_name": metadata["producer_name"],
+            "norm_name": metadata["norm_name"],
+            "consumer_name": metadata["consumer_name"],
+        }
+        group_rows.append(
+            {
+                **common,
+                "channels": int(len(values)),
+                "importance_min": float(values.min()),
+                "importance_max": group_max,
+                "importance_mean": group_mean,
+                "importance_median": float(np.median(values)),
+                "importance_std": float(values.std(ddof=0)),
+                "zero_channels": zero_channels,
+                "zero_fraction": float(zero_channels / len(values)),
+            }
+        )
+        for channel, raw_value in enumerate(values):
+            channel_rows.append(
+                {
+                    **common,
+                    "channel": int(channel),
+                    "importance_raw": float(raw_value),
+                    "importance_normalized": float(normalized[channel]),
+                    "importance_over_group_mean": float(mean_ratio[channel]),
+                    "within_group_percentile": float(percentiles[channel]),
+                }
+            )
+
+    group_rows.sort(key=lambda row: (row["stage"], row["block"], row["group_kind"]))
+    ranking_rows = sorted(
+        channel_rows,
+        key=lambda row: (
+            row["importance_normalized"],
+            row["importance_raw"],
+            row["group_id"],
+            row["channel"],
+        ),
+    )
+    for rank, row in enumerate(ranking_rows, start=1):
+        row["global_rank_least_to_most"] = rank
+    return group_rows, channel_rows, ranking_rows

@@ -1,0 +1,92 @@
+{
+  "reference_name": "historical_main_tau_0.01875",
+  "dataset": {
+    "kaggle_slug": "thanhmay2406/dataset-for-research",
+    "dataset_id": 10816012,
+    "last_updated": "2026-09-03 04:06:41.770000",
+    "train_split": "train",
+    "evaluation_split": "test",
+    "test_images": 704,
+    "test_annotations": 758,
+    "test_annotation_sha256": "e15c6d5ff9b2432e79fdd0f752b1474a1b1ff758abca47196a9f335632a06cf2"
+  },
+  "baseline": {
+    "relative_path": "outputs/E0_baseline/checkpoints/best.pth",
+    "sha256": "953a2b8d8e412227a89b9dd42c0899b33de28f281110af54829ec531db16dda0",
+    "parameters": 41377906
+  },
+  "probe": {
+    "relative_path": "outputs/results/probe_300.coco.json",
+    "sha256": "1016ed7eacda87c6b368c880a5564799e22e7fa757e11cd9cf93845b396d811d",
+    "images": 300,
+    "image_split": "train",
+    "batch_size": 1,
+    "num_workers": 2
+  },
+  "xai": {
+    "method": "absolute_gradient_times_activation_mean_hw",
+    "target": "post_nms_gt_matched_confidence_plus_localization",
+    "match_iou_threshold": 0.5,
+    "weight_matches_by_iou": true,
+    "confidence_target_weight": 0.7,
+    "localization_target_weight": 0.3,
+    "analyze_empty_images": true,
+    "empty_fp_importance_weight": 0.1,
+    "normalization": "group_max",
+    "ranking_rows": 7552,
+    "groups": 32,
+    "group_stages": ["layer1", "layer2", "layer3", "layer4"],
+    "group_convs": ["conv1", "conv2"],
+    "historical_ranking_relative_path": "outputs/results/pruning_group_global_ranking_resnet_bottleneck.csv",
+    "historical_ranking_sha256": "76d205979f1e472a5873e2fd0db207a277911435e84097e00d6fc1f22e4f3231"
+  },
+  "pruning": {
+    "candidate": "main",
+    "tau": 0.01875,
+    "threshold_operator": "less_than_or_equal",
+    "min_remaining_channels": 1,
+    "expected_groups_pruned": 30,
+    "expected_channels_pruned": 481,
+    "expected_parameters_after": 39182184,
+    "historical_main_checkpoint_relative_path": "outputs/results/pipeline03_main_tau_0.0187500.pth",
+    "historical_main_checkpoint_sha256": "968f179318e355c1bb6d373828e85ebfc201dfde885cd0dc995852ff93e33f90",
+    "historical_plan_relative_path": "outputs/results/pipeline03_locked_candidates.json",
+    "historical_plan_sha256": "22ef230f4bc858ad96c9d8608c3e9e0f6d46c33e008d44ab892c03e511dd0a49",
+    "post_pruning_finetuning": false
+  },
+  "evaluation": {
+    "type": "pycocotools_COCOeval_bbox",
+    "batch_size": 2,
+    "num_workers": 2,
+    "score_threshold": 0.05,
+    "nms_threshold": 0.5,
+    "detections_per_image": 100,
+    "metric_abs_tolerance": 0.0005,
+    "historical_baseline": {
+      "map": 0.3992328799877444,
+      "ap50": 0.8041968887166542,
+      "ap75": 0.3437340745465815,
+      "ap_small": 0.0,
+      "ap_medium": 0.3063767059290873,
+      "ap_large": 0.4870997485897336,
+      "ar1": 0.4649824081595221,
+      "ar10": 0.5263079210774552,
+      "ar100": 0.5263079210774552,
+      "num_predictions": 2665
+    },
+    "historical_main": {
+      "map": 0.4020090521003226,
+      "ap50": 0.8089298945520845,
+      "ap75": 0.347265421158268,
+      "ap_small": 0.0,
+      "ap_medium": 0.3093507155453942,
+      "ap_large": 0.48032956169484864,
+      "ar1": 0.4625050560301156,
+      "ar10": 0.5291356972539565,
+      "ar100": 0.5291356972539565,
+      "num_predictions": 2685
+    }
+  },
+  "seed": 42,
+  "device": "cuda"
+}

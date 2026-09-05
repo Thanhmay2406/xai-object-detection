@@ -5,6 +5,9 @@ evaluation, XAI, or pruning implementations. Kaggle uploads `runner.py`, which
 clones the configured Git branch and delegates to a script already in the
 repository.
 
+The complete Vietnamese operations runbook is available at
+[`docs/kaggle_gpu_runbook_vi.md`](../docs/kaggle_gpu_runbook_vi.md).
+
 ## Before the first push
 
 1. Commit and push the source and `configs/kaggle.yaml`. The local launch script
@@ -32,15 +35,13 @@ repository. If a future private clone is needed, use Kaggle Secrets.
 ## Arch Linux setup
 
 ```bash
-sudo pacman -S python-pipx
-pipx ensurepath
-pipx install kaggle
-kaggle auth login
-kaggle kernels list --mine
+./.venv/bin/python -m pip show kaggle
+./.venv/bin/kaggle auth login
+./.venv/bin/kaggle kernels list --mine
 ```
 
-`kaggle auth login` uses the current OAuth browser flow. The CLI can print a URL
-instead with `kaggle auth login --no-launch-browser`. Credentials stay in the
+`.venv/bin/kaggle auth login` uses the current OAuth browser flow. The CLI can print a URL
+instead with `.venv/bin/kaggle auth login --no-launch-browser`. Credentials stay in the
 user account/configuration area and must never be copied into the repository.
 
 ## First GPU smoke test
@@ -72,7 +73,7 @@ entry point, and place its CLI arguments in `execution.args`. For example,
 output argument. Additional arguments can also be used for direct invocation:
 
 ```bash
-python kaggle/runner.py --config configs/kaggle.yaml -- --device cuda
+./.venv/bin/python kaggle/runner.py --config configs/kaggle.yaml -- --device cuda
 ```
 
 Suggested output convention:
