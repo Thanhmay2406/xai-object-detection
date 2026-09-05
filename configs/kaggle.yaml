@@ -1,4 +1,4 @@
-# Non-sensitive orchestration settings for the frozen historical Main reproduction.
+# Non-sensitive orchestration settings. The default is intentionally smoke-only.
 repository:
   repo_url: https://github.com/Thanhmay2406/xai-object-detection.git
   branch: main
@@ -7,25 +7,14 @@ model:
   num_classes: 7
 
 execution:
-  mode: run
-  entry_point: scripts/reproduce_main.py
-  args:
-    - --reference
-    - configs/historical_main_reference.json
-    - --dataset-root
-    - /kaggle/input/dataset-for-research/drill_bit_coco
-    - --baseline-checkpoint
-    - /kaggle/input/dataset-for-research/outputs/E0_baseline/checkpoints/best.pth
-    - --historical-artifacts
-    - /kaggle/input/dataset-for-research/outputs/results
-    - --config-file
-    - configs/kaggle.yaml
-    - --device
-    - cuda
+  mode: smoke_test
+  entry_point: scripts/evaluate.py
+  args: []
   output_arg: --output-dir
 
 artifacts:
   # Relative paths resolve below /kaggle/working on Kaggle.
-  output_dir: full_reproduction_main_tau_0_01875
+  output_dir: xai_pruning_outputs
 
-# This is one run only: no baseline training, fine-tuning, sweep, or ablation.
+# For an experiment, change mode to run and provide the entry point's arguments.
+# Dataset/checkpoint paths should point into attached /kaggle/input datasets.
