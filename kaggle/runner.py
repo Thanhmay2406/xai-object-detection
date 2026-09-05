@@ -169,6 +169,20 @@ def install_project(repository: Path, skip_install: bool) -> None:
         )
 
 
+def add_project_source_to_path(repository: Path) -> Path:
+    """Expose the freshly cloned src-layout package to this running process."""
+
+    source_root = (repository / "src").resolve()
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"Project source directory not found: {source_root}")
+    source_value = str(source_root)
+    if source_value in sys.path:
+        sys.path.remove(source_value)
+    sys.path.insert(0, source_value)
+    print("Project source path:", source_root, flush=True)
+    return source_root
+
+
 def load_yaml_config(repository: Path, config_value: str) -> tuple[dict[str, Any], Path]:
     import yaml
 
@@ -298,6 +312,7 @@ def main() -> None:
     environment = print_environment(in_kaggle)
     repository = prepare_repository(args, in_kaggle)
     install_project(repository, args.skip_install)
+    add_project_source_to_path(repository)
     config, config_path = load_yaml_config(repository, args.config)
     output_dir = resolve_output_dir(repository, in_kaggle, args.output_dir, config)
 
