@@ -26,4 +26,5 @@ mkdir -p "${OUTPUT_DIR}"
 echo "Downloading latest output from ${KERNEL_ID}"
 echo "Destination: ${OUTPUT_DIR}"
 # Deliberately omit --force so existing local result files are not overwritten.
-kaggle kernels output "${KERNEL_ID}" -p "${OUTPUT_DIR}"
+# Use one large page so nested artifacts are not omitted by the CLI default.
+kaggle kernels output "${KERNEL_ID}" -p "${OUTPUT_DIR}" --page-size 200
