@@ -1,0 +1,20 @@
+# Non-sensitive orchestration settings. The default is intentionally smoke-only.
+repository:
+  repo_url: https://github.com/Thanhmay2406/xai-object-detection.git
+  branch: main
+
+model:
+  num_classes: 7
+
+execution:
+  mode: smoke_test
+  entry_point: scripts/evaluate.py
+  args: []
+  output_arg: --output-dir
+
+artifacts:
+  # Relative paths resolve below /kaggle/working on Kaggle.
+  output_dir: xai_pruning_outputs
+
+# For an experiment, change mode to run and provide the entry point's arguments.
+# Dataset/checkpoint paths should point into attached /kaggle/input datasets.

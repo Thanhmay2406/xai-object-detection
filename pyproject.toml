@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xai-pruning"
+version = "0.1.0"
+description = "Reusable research code for XAI-guided structural pruning of Faster R-CNN + FPN"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pillow",
+    "pycocotools",
+    "pyyaml",
+    "torch",
+    "torchvision",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["xai_pruning*"]
