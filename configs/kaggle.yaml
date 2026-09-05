@@ -13,11 +13,11 @@ execution:
     - --reference
     - configs/historical_main_reference.json
     - --dataset-root
-    - /kaggle/input/datasets/thanhmay2406/dataset-for-research/drill_bit_coco
+    - /kaggle/input/dataset-for-research/drill_bit_coco
     - --baseline-checkpoint
-    - /kaggle/input/datasets/thanhmay2406/dataset-for-research/outputs/E0_baseline/checkpoints/best.pth
+    - /kaggle/input/dataset-for-research/outputs/E0_baseline/checkpoints/best.pth
     - --historical-artifacts
-    - /kaggle/input/datasets/thanhmay2406/dataset-for-research/outputs/results
+    - /kaggle/input/dataset-for-research/outputs/results
     - --config-file
     - configs/kaggle.yaml
     - --device
